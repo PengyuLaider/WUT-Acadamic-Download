@@ -7,7 +7,7 @@ import shutil
 import zipfile
 
 ROOT=Path(__file__).resolve().parent
-FILES=['README.md','SECURITY.md','.gitignore','requirements-dev.txt','campus_portal.py','登录配置界面.py','填写登录配置.ps1','登录图书馆.ps1','检查本地环境.ps1','登录配置.example.json','export_public.py']
+FILES=['VERSION','CHANGELOG.md','README.en.md','README.md','SECURITY.md','.gitignore','.gitattributes','requirements-dev.txt','campus_portal.py','登录配置界面.py','填写登录配置.ps1','登录图书馆.ps1','检查本地环境.ps1','登录配置.example.json','export_public.py']
 TREES=['ui','docs','skill-src','.github']
 
 def allowed(path):

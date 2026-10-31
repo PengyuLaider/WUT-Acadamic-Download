@@ -35,7 +35,7 @@ class PortalTests(unittest.TestCase):
         code,_,body=self.request('GET','/status');self.assertEqual(code,200);self.assertEqual(json.loads(body)['status'],'credentials_missing');self.assertFalse(self.config.exists())
     def test_page_and_assets(self):
         code,headers,body=self.request('GET','/');self.assertEqual(code,200);self.assertIn(b'csrf-token',body);self.assertIn("script-src 'self'",headers['Content-Security-Policy'])
-        for name in ('app.css','app.js','mark.svg'): self.assertEqual(self.request('GET','/assets/'+name)[0],200)
+        for name in ('app.css','app.js','mark.svg','i18n.js'): self.assertEqual(self.request('GET','/assets/'+name)[0],200)
     def test_save_without_echo(self):
         code,_,body=self.save();self.assertEqual(code,200);self.assertEqual(json.loads(body)['status'],'ready');self.assertNotIn(b'FAKE-CAMPUS-USER',body);self.assertNotIn(b'not-a-real-password',body)
         self.assertEqual(json.loads(self.config.read_text())['username'],'FAKE-CAMPUS-USER')

@@ -3,6 +3,8 @@
 ## v2.0.0 — 2026-10-31
 
 - 白底深蓝校园门户界面，支持桌面、平板和手机布局。
+- 中英文页面切换、独立英文说明及项目展示首页。
+- 明确 main、功能分支与版本标签的职责，新增 v1/v2 发布归档。
 - 账号配置、学校认证、全文核验分别显示状态。
 - 完善密码切换、字段校验、保存反馈与原配置保留。
 - 增加无账号静态演示、截图和本机前台启动方式。
@@ -11,3 +13,15 @@
 - 公开源码移除论文全文、下载清单和过期的生成文件哈希清单；已有 Git 历史保留。
 
 真实学校账号登录及下载链路仍需按环境现场验证。凭据保持本机使用，不提交仓库。
+
+### v2 bilingual update
+
+- Chinese/English portal with translated static text, input hints and feedback.
+- Separate Chinese and English README files, version comparison and workflow diagrams.
+- v1.0.0 retained as a historical snapshot; v2.0.0 remains the current portal release.
+
+## v1.0.0 — 初始版本 / Original version
+
+保留初始 main 提交 `3c1df5475c15609128da9a93bfebd60d1a91b673`，提供旧版命令行实现供兼容与历史对照。v2 不覆盖这个版本。
+
+Preserves the original main commit for CLI compatibility and historical comparison. Version 2 does not overwrite this snapshot.

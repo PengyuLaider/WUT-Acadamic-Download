@@ -118,7 +118,7 @@ class Handler(BaseHTTPRequestHandler):
         elif resource == "/status":
             self._json(200, {"service": SERVICE_ID, "credential_values_returned": False,
                             **public_status(self.server.config_path, self.server.demo)})
-        elif resource in ("/assets/app.css", "/assets/app.js", "/assets/mark.svg"):
+        elif resource in ("/assets/app.css", "/assets/app.js", "/assets/i18n.js", "/assets/mark.svg"):
             extension = Path(resource).suffix
             content_type = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml"}[extension]
             self._send(200, (UI / Path(resource).name).read_bytes(), content_type)
