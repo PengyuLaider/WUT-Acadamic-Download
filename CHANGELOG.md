@@ -1,5 +1,11 @@
 # 更新记录
 
+## main 文档更新 / Documentation on main
+
+- 丰富中英文项目介绍、适用场景、入口选择、输出与结果状态、智能体任务示例和常见问题。
+- 新增双语流程概览图，完善仓库首页导航；既有 v1.0.0 / v2.0.0 标签与附件保持固定。
+- Expanded bilingual project overview, use cases, entry points, output states, agent examples and FAQ. Existing release snapshots remain unchanged.
+
 ## v2.0.0 — 2026-10-31
 
 - 白底深蓝校园门户界面，支持桌面、平板和手机布局。
