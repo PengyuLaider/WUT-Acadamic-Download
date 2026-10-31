@@ -1,6 +1,7 @@
 """Offline regression tests: all external HTTP and resolver operations are mocked."""
 import argparse
 import contextlib
+import csv
 import hashlib
 import io
 import json
@@ -205,11 +206,21 @@ class Offline(unittest.TestCase):
 
     def test_import_and_organize(self):
         path, manifest, record=self.seed()
+        # One file can have different absolute spellings (e.g. Windows short paths).
+        alias=self.root/'nested'; alias.mkdir()
+        record['path']=str(alias/'..'/path.name)
+        manifest.write_text(json.dumps(record)+'\n',encoding='utf-8')
         args=argparse.Namespace(file=str(path),doi=DOI,title=TITLE,out=str(self.root),source_url='https://e.org/paper?token=secret')
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(oa.cmd_import_file(args,self.cfg),0)
             self.assertEqual(oa.cmd_organize(argparse.Namespace(dir=str(self.root)),self.cfg),0)
-        self.assertNotIn('secret',manifest.read_text()); self.assertEqual((self.root/'index.csv').read_text(encoding='utf-8-sig').count(TITLE),1)
+        self.assertNotIn('secret',manifest.read_text())
+        with (self.root/'index.csv').open(encoding='utf-8-sig',newline='') as handle:
+            rows=list(csv.DictReader(handle))
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['title'],TITLE)
+        self.assertEqual(rows[0]['doi'],DOI)
+        self.assertEqual(list(self.root.glob('*.pdf')),[path])
 
     def test_rewrite_idempotent(self):
         url=vpn.to_webvpn('https://example.org/file?x=1#page=3')

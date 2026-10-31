@@ -896,13 +896,14 @@ def norm_identifier(value: str) -> str:
 def record_path(record: dict, manifest: Path) -> Path:
     p = Path(record.get("path") or "__missing__")
     if p.is_absolute():
-        return p
+        # Normalize aliases before comparing paths or choosing an import destination.
+        return p.resolve()
     # Legacy records stored paths relative to the original working directory.
     # Try beside manifest, then its parent, without depending on current cwd.
     for candidate in (manifest.parent / p, manifest.parent.parent / p):
         if candidate.is_file():
             return candidate.resolve()
-    return manifest.parent / p
+    return (manifest.parent / p).resolve()
 
 
 def record_file_valid(record: dict, manifest: Path) -> bool:
@@ -1156,7 +1157,7 @@ def cmd_organize(args, cfg: dict) -> int:
     manifest = target / "manifest.jsonl"
     records = read_manifest(manifest)
     # Later verification supersedes earlier pending records of the same local file.
-    records = list({str(record_path(r, manifest)): r for r in records}.values())
+    records = list({record_path(r, manifest): r for r in records}.values())
     if not records:
         print(json.dumps({"status": "empty", "message": f"没有找到 {manifest}"}, ensure_ascii=False))
         return 2
