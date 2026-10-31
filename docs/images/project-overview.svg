@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" fill="none" role="img" aria-labelledby="title desc">
+<title id="title">校园文献助手：从资源接入到论文核验归档 / Campus Library Papers workflow</title>
+<desc id="desc">校园网或开放获取路径，定位指定论文，检查 PDF 和篇目信息，记录来源、版本及哈希。Campus access or OA, find the paper, verify the PDF, and record its provenance.</desc>
+<rect x="1" y="1" width="1198" height="358" rx="6" fill="#F4F7FB" stroke="#DCE4EC"/>
+<path d="M6 1H1194Q1199 1 1199 6V8H1V6Q1 1 6 1Z" fill="#173E69"/>
+<g font-family="Microsoft YaHei, PingFang SC, system-ui, sans-serif">
+<text x="46" y="58" fill="#596B80" font-size="13" letter-spacing="2">CAMPUS LIBRARY PAPERS</text>
+<text x="46" y="106" fill="#172F4B" font-size="31" font-weight="700">从校园资源接入，到论文核验归档</text>
+<text x="46" y="138" fill="#596B80" font-size="16">A local workflow for access, retrieval, verification and records.</text>
+<g transform="translate(46 178)">
+<rect width="248" height="116" fill="white" stroke="#DCE4EC"/>
+<path d="M0 0H248" stroke="#173E69" stroke-width="3"/>
+<text x="20" y="37" fill="#172F4B" font-size="19" font-weight="600">资源接入</text>
+<text x="20" y="62" fill="#596B80" font-size="13">Campus access / Open access</text>
+<text x="20" y="92" fill="#173E69" font-size="14">校园网 · WebVPN · OA</text>
+</g>
+<path d="M300 236H322M315 230L322 236L315 242" stroke="#596B80" stroke-width="2"/>
+<g transform="translate(332 178)">
+<rect width="248" height="116" fill="white" stroke="#DCE4EC"/>
+<path d="M0 0H248" stroke="#173E69" stroke-width="3"/>
+<text x="20" y="37" fill="#172F4B" font-size="19" font-weight="600">定位论文</text>
+<text x="20" y="62" fill="#596B80" font-size="13">Find the requested paper</text>
+<text x="20" y="92" fill="#173E69" font-size="14">DOI · URL · 已确认清单</text>
+</g>
+<path d="M586 236H608M601 230L608 236L601 242" stroke="#596B80" stroke-width="2"/>
+<g transform="translate(618 178)">
+<rect width="248" height="116" fill="white" stroke="#DCE4EC"/>
+<path d="M0 0H248" stroke="#173E69" stroke-width="3"/>
+<text x="20" y="37" fill="#172F4B" font-size="19" font-weight="600">核验全文</text>
+<text x="20" y="62" fill="#596B80" font-size="13">Verify the file and its identity</text>
+<text x="20" y="92" fill="#173E69" font-size="14">PDF · 题名 / DOI · SHA-256</text>
+</g>
+<path d="M872 236H894M887 230L894 236L887 242" stroke="#596B80" stroke-width="2"/>
+<g transform="translate(904 178)">
+<rect width="248" height="116" fill="white" stroke="#DCE4EC"/>
+<path d="M0 0H248" stroke="#173E69" stroke-width="3"/>
+<text x="20" y="37" fill="#172F4B" font-size="19" font-weight="600">记录归档</text>
+<text x="20" y="62" fill="#596B80" font-size="13">Keep a traceable local record</text>
+<text x="20" y="92" fill="#173E69" font-size="14">来源 · 版本 · 索引 · 状态</text>
+</g>
+<text x="46" y="332" fill="#596B80" font-size="13">本机运行 / Local-first</text>
+<text x="375" y="332" fill="#596B80" font-size="13">中文与英文 / Chinese + English</text>
+<text x="810" y="332" fill="#596B80" font-size="13">配置、认证与核验分别记录 / Separate states</text>
+</g></svg>
