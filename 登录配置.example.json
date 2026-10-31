@@ -1,0 +1,8 @@
+{
+  "_说明": "公共空白示例。正式使用可通过本机配置界面填写，或复制为 登录配置.private.json 后本机编辑。",
+  "enabled": true,
+  "username": "",
+  "password": "",
+  "login_url": "https://webvpn.whut.edu.cn/login?cas_login=true",
+  "auto_submit": false
+}

@@ -1,8 +1,12 @@
 {
-  "_readme": "复制本文件为 config.json 后修改。email 必填真实邮箱（用于 Crossref/Unpaywall 礼貌标识，不能用 example.com）。不要在这个文件里写密码；账号密码请用 `campus_net.ps1 -Action save-cred` 保存（Windows DPAPI 加密），或临时设置 CAMPUS_USERNAME / CAMPUS_PASSWORD 环境变量。",
+  "_readme": "通用学校与 OA 配置，不放账号密码。用户要求的本机账号密码请填包根目录 登录配置.private.json，由 登录图书馆.ps1 入口读取；也保留 DPAPI/环境变量给原通用表单辅助使用。邮箱影响需要邮箱的 OA 来源；不填写时跳过对应来源。",
   "school": {
     "name": "武汉理工大学",
-    "domains": ["whut.edu.cn", "lib.whut.edu.cn", "zhlgd.whut.edu.cn"]
+    "domains": [
+      "whut.edu.cn",
+      "lib.whut.edu.cn",
+      "zhlgd.whut.edu.cn"
+    ]
   },
   "email": "",
   "download_dir": "papers",
@@ -10,30 +14,55 @@
     {
       "name": "图书馆首页",
       "url": "https://lib.whut.edu.cn/",
-      "must_contain": ["武汉理工大学"],
-      "login_markers": []
+      "must_contain": [
+        "武汉理工大学"
+      ],
+      "login_markers": [],
+      "proves_campus_access": false,
+      "evidence": "reachability_only"
     },
     {
       "name": "超星智慧图书馆-数据库列表",
-      "url": "https://wisdom.chaoxing.com/newwisdom/doordatabase/database.html?pageId=527321&wfwfid=25279&websiteId=285586&sw=&uid=46691481&dataType=100001",
+      "url": "https://wisdom.chaoxing.com/newwisdom/doordatabase/database.html?pageId=527321&wfwfid=25279&websiteId=285586&sw=&dataType=100001",
       "must_contain": [],
-      "must_not_contain": ["不在授权范围", "IP地址不在"],
-      "login_markers": []
+      "must_not_contain": [
+        "不在授权范围",
+        "IP地址不在"
+      ],
+      "login_markers": [],
+      "proves_campus_access": false,
+      "evidence": "reachability_only"
     }
   ],
   "campus_cidrs": [],
   "captive_portal_probes": [
-    { "url": "http://www.msftconnecttest.com/connecttest.txt", "expect": "Microsoft Connect Test" },
-    { "url": "http://connect.rom.miui.com/generate_204", "expect": "204" }
+    {
+      "url": "http://www.msftconnecttest.com/connecttest.txt",
+      "expect": "Microsoft Connect Test"
+    },
+    {
+      "url": "http://connect.rom.miui.com/generate_204",
+      "expect": "204"
+    }
   ],
-  "public_ip_probes": ["https://api.ipify.org?format=json", "https://ifconfig.me/ip", "https://myip.ipip.net"],
+  "public_ip_probes": [
+    "https://api.ipify.org?format=json",
+    "https://ifconfig.me/ip",
+    "https://myip.ipip.net"
+  ],
   "webvpn": {
     "enabled": true,
     "base": "https://webvpn.whut.edu.cn",
     "login_url": "https://webvpn.whut.edu.cn/login?cas_login=true",
     "cookie_env": "WEBVPN_COOKIE",
     "probe_target": "https://lib.whut.edu.cn/",
-    "login_markers": ["登录", "login", "统一身份认证", "cas", "验证码"]
+    "login_markers": [
+      "登录",
+      "login",
+      "统一身份认证",
+      "cas",
+      "验证码"
+    ]
   },
   "carsi": {
     "enabled": true,
@@ -47,19 +76,41 @@
     "username_field": "un",
     "password_field": "pd",
     "extra_fields": {},
-    "hidden_fields": ["lt", "execution", "_eventId"],
+    "hidden_fields": [
+      "lt",
+      "execution",
+      "_eventId"
+    ],
     "success_url_contains": [],
-    "success_body_contains": ["退出", "个人中心", "统一身份认证"],
-    "failure_body_contains": ["用户名或密码", "密码错误", "验证码错误", "invalid", "登录失败"],
-    "captcha_markers": ["验证码", "captcha", "kaptcha", "codeimage"],
+    "success_body_contains": [
+      "退出登录"
+    ],
+    "failure_body_contains": [
+      "用户名或密码",
+      "密码错误",
+      "验证码错误",
+      "invalid",
+      "登录失败"
+    ],
+    "captcha_markers": [
+      "验证码",
+      "captcha",
+      "kaptcha",
+      "codeimage"
+    ],
     "open_browser_on_manual": true,
-    "manual_verify_hint": "学校统一认证（智慧理工大 tpass）需要图形验证码且密码由页面 JS 加密，agent 不代填。请在弹出的浏览器里手动登录，登录成功后回复“已登录”，再继续。"
+    "manual_verify_hint": "此处为通用手工登录引导；要使用本机私密配置自动填表，请运行包根目录 登录图书馆.ps1。验证码、扫码和二次验证仍由用户完成。"
   },
   "credentials": {
     "dpapi_file": ""
   },
-  "sources": ["openalex", "crossref", "semanticscholar", "arxiv"],
-  "request_interval_seconds": 0.4,
+  "sources": [
+    "openalex",
+    "crossref",
+    "semanticscholar",
+    "arxiv"
+  ],
+  "request_interval_seconds": 1.0,
   "max_pdf_mb": 120,
   "timeout_seconds": 30
 }

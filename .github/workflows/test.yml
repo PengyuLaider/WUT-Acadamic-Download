@@ -1,0 +1,56 @@
+name: Offline checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m unittest discover -s skill-src/tests -p "test_*.py" -v
+      - run: node --test skill-src/tests/test_browser.js skill-src/tests/test_login.js skill-src/tests/test_i18n.js
+      - run: powershell -NoProfile -File skill-src/tests/test_network.ps1
+      - run: python skill-src/scripts/webvpn_url.py --selftest
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: tests
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build clean source archive
+        run: python export_public.py --out dist/campus-library-papers
+      - name: Publish version if new
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: pwsh
+        run: |
+          gh release view v1.0.0 --repo $env:GH_REPO 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            git archive --format=zip --output=dist/campus-library-papers-v1.0.0.zip 3c1df5475c15609128da9a93bfebd60d1a91b673 README.md skill-src
+            if ($LASTEXITCODE -ne 0) { throw 'Legacy archive failed' }
+            gh release create v1.0.0 dist/campus-library-papers-v1.0.0.zip --target 3c1df5475c15609128da9a93bfebd60d1a91b673 --title 'v1.0.0 - Original version' --notes-file docs/releases/v1.0.0.md --latest=false --repo $env:GH_REPO
+            if ($LASTEXITCODE -ne 0) { throw 'Legacy release failed' }
+          }
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid VERSION' }
+          $tag = "v$version"
+          gh release view $tag --repo $env:GH_REPO 2>$null
+          if ($LASTEXITCODE -eq 0) { Write-Output "$tag already exists"; exit 0 }
+          gh release create $tag dist/campus-library-papers.zip --target $env:GITHUB_SHA --title "$tag - Campus Library Papers" --notes-file CHANGELOG.md --repo $env:GH_REPO
+          if ($LASTEXITCODE -ne 0) { throw 'Release creation failed' }

@@ -1,0 +1,2 @@
+# Optional PDF verification and offline regression tests; UI itself uses stdlib only.
+pypdf==6.10.0

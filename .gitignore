@@ -1,0 +1,14 @@
+*.private.json
+*.private.json.*
+**/cred.xml
+**/browser-profile/
+**/__pycache__/
+**/*.pyc
+/papers/
+/备份_*/
+/GitHub发布包/
+/original-hashes.json
+/writeback-receipt.json
+/skill-src/config/config.json
+
+/dist/
