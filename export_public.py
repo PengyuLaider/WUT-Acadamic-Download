@@ -33,7 +33,7 @@ def export(destination):
         else: shutil.copyfile(source,target)
         manifest.append({'path':relative.as_posix(),'sha256':hashlib.sha256(target.read_bytes()).hexdigest()})
     (destination/'release-manifest.json').write_text(json.dumps({'files':manifest,'private_files_included':False,'papers_included':False},indent=2),encoding='utf-8')
-    archive=destination.with_suffix('.zip')
+    archive=destination.parent/(destination.name+'.zip')
     if archive.exists(): raise ValueError('ZIP 已存在，拒绝覆盖')
     with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as output:
         for p in destination.rglob('*'):
