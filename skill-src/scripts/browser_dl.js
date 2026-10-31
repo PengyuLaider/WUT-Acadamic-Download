@@ -19,7 +19,7 @@
  *        --out papers --json
  *
  * 输出（stdout，一行 JSON）：{status, saved, bytes, title, url, need_user, candidates, note}
- *   status: downloaded | need_user | no_pdf_found | error
+ *   status: saved_pending_verification | selection_required | need_user | no_pdf_found | error
  */
 'use strict';
 
@@ -28,27 +28,45 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const https = require('https');
+const { Cdp, sanitize, publicUrl, requiresUser, basicPdf } = require('./browser_support');
+const {DEFAULT_FILE, approvedOrigin, readCredentials, credentialStatus, fillLogin} = require('./login_credentials');
 
 // ---------------------------------------------------------------------------
 // 参数
 // ---------------------------------------------------------------------------
 function parseArgs(argv) {
-  const args = { url: '', out: '', timeout: 90, waitUser: 180, json: false, headless: false, doi: '', title: '', site: '', search: '' };
+  const args = { url: '', out: '', timeout: 90, waitUser: 180, json: false, headless: false, doi: '', title: '', site: '', search: '', select: null, login: false, credentials: '', noProxy: process.env.CAMPUS_BROWSER_NO_PROXY === '1' };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
+    if (['--url','--out','--timeout','--wait-user','--doi','--title','--site','--search','--select','--credentials'].includes(a)
+        && (!argv[i + 1] || argv[i + 1].startsWith('--'))) throw new Error(a + ' 缺少参数值');
     if (a === '--url') args.url = argv[++i];
     else if (a === '--out') args.out = argv[++i];
-    else if (a === '--timeout') args.timeout = parseInt(argv[++i], 10);
-    else if (a === '--wait-user') args.waitUser = parseInt(argv[++i], 10);
+    else if (a === '--timeout') args.timeout = Number(argv[++i]);
+    else if (a === '--wait-user') args.waitUser = Number(argv[++i]);
     else if (a === '--doi') args.doi = argv[++i];
     else if (a === '--title') args.title = argv[++i];
     else if (a === '--site') args.site = (argv[++i] || '').toLowerCase();
     else if (a === '--search') args.search = argv[++i];
+    else if (a === '--select') args.select = Number(argv[++i]);
+    else if (a === '--credentials') args.credentials = argv[++i];
+    else if (a === '--login') args.login = true;
+    else if (a === '--help' || a === '-h') args.help = true;
     else if (a === '--json') args.json = true;
     else if (a === '--headless') args.headless = true;
     else if (a === '--dump') args.dump = true;
-    else if (!args.url) args.url = a;
+    else if (a === '--no-proxy') args.noProxy = true;
+    else if (a === '--use-proxy') args.noProxy = false;
+    else if (!a.startsWith('-') && !args.url) args.url = a;
+    else throw new Error('未知参数: ' + a);
   }
+  if (args.help) return args;
+  if (args.login && (args.url || args.search || args.doi || args.dump)) throw new Error('--login 为独立登录动作，请勿与文章/搜索/诊断参数合用');
+  if (args.login) args.url = 'https://webvpn.whut.edu.cn/login?cas_login=true';
+  if (args.doi && !/^10\.\d{4,9}\/\S+$/.test(args.doi)) throw new Error('--doi 格式无效');
+  for (const n of ['timeout', 'waitUser']) if (!Number.isFinite(args[n]) || args[n] < 1 || args[n] > 1800) throw new Error(n + ' 必须为 1..1800 秒');
+  if (args.select !== null && (!Number.isInteger(args.select) || args.select < 1)) throw new Error('--select 必须为正整数');
+  if (args.select !== null && !args.search) throw new Error('--select 仅可与 --search 一起使用');
   const SITE_SEARCH = {
     cnki: (kw) => `https://kns.cnki.net/kns8s/defaultresult/index?kw=${encodeURIComponent(kw)}`,
     wanfang: (kw) => `https://s.wanfangdata.com.cn/paper?q=${encodeURIComponent(kw)}`,
@@ -57,24 +75,39 @@ function parseArgs(argv) {
   if (args.search && !args.url) {
     const build = SITE_SEARCH[args.site || 'cnki'];
     if (!build) {
-      console.error('--site 只支持: ' + Object.keys(SITE_SEARCH).join(' / '));
-      process.exit(2);
+      throw new Error('--site 只支持: ' + Object.keys(SITE_SEARCH).join(' / '));
     }
     args.url = build(args.search);
   }
   if (!args.url && args.doi) args.url = 'https://doi.org/' + args.doi;
-  if (!args.url) {
-    console.error('用法: node browser_dl.js --url <文章URL或DOI> [--out 目录] [--wait-user 240] [--json]');
-    console.error('      node browser_dl.js --site cnki --search "深度学习" [--out 目录]   # 知网检索后自动下载第一篇');
-    process.exit(2);
-  }
+  if (!args.url) throw new Error('缺少 --url / --doi / --search；使用 --help 查看用法');
   if (!/^https?:\/\//i.test(args.url)) {
-    args.url = 'https://doi.org/' + args.url.replace(/^doi:\s*/i, '');
+    const doi = args.url.replace(/^doi:\s*/i, '');
+    if (!/^10\.\d{4,9}\/\S+$/.test(doi)) throw new Error('需要 HTTP(S) URL 或 DOI');
+    args.url = 'https://doi.org/' + doi;
   }
+  const parsed = new URL(args.url);
+  if (parsed.username || parsed.password) throw new Error('URL 不得含账号密码');
   return args;
 }
 
+async function main() {
 const args = parseArgs(process.argv);
+if (args.help) {
+  console.log('node browser_dl.js --url <文章URL或DOI> [--doi DOI] [--title 题名] [--out papers] [--no-proxy]\nnode browser_dl.js --site cnki|wanfang|vip --search 关键词 [--select 1]\n检索默认只列候选；--select 为用户确认后选定的序号。--dump 只返回精简诊断。\n--no-proxy：独立浏览器绕过系统代理直连校园网（Clash/VPN 开着时机构 IP 授权会失效，必须加）');
+  console.log('node browser_dl.js --login [--credentials 本地配置路径] [--wait-user 240]');
+  return;
+}
+let loginCredentials = null;
+const credentialFile = args.credentials || (args.login ? DEFAULT_FILE : '');
+if (credentialFile) {
+  const check = credentialStatus(credentialFile);
+  if (check.status !== 'ready') { console.log(JSON.stringify(check)); process.exitCode = 2; return; }
+  loginCredentials = readCredentials(credentialFile);
+  if (args.login) args.url = loginCredentials.login_url;
+}
+const overall = setTimeout(() => fail('本次操作总时限已到；可在原浏览器完成验证后重跑'), (args.timeout + args.waitUser + 120) * 1000);
+overall.unref();
 const outDir = path.resolve(args.out || path.join(process.cwd(), 'papers'));
 fs.mkdirSync(outDir, { recursive: true });
 
@@ -92,17 +125,20 @@ if (!browserExe) {
 const profileDir = process.env.CAMPUS_BROWSER_PROFILE
   || path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh', 'campus-papers', 'browser-profile');
 fs.mkdirSync(profileDir, { recursive: true });
-const port = parseInt(process.env.CAMPUS_BROWSER_PORT || '9333', 10);
+const port = Number(process.env.CAMPUS_BROWSER_PORT || '9333');
+if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('CAMPUS_BROWSER_PORT 无效');
+const downloadEvents = new Map();
+const ownFrames = new Set();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function fail(message, extra = {}) {
   const payload = { status: 'error', message, ...extra };
-  console.log(JSON.stringify(payload));
+  console.log(JSON.stringify(sanitize(payload)));
   process.exit(1);
 }
 function log(...parts) {
-  console.error('[browser_dl]', ...parts);
+  console.error('[browser_dl]', ...parts.map(sanitize));
 }
 
 // ---------------------------------------------------------------------------
@@ -110,68 +146,73 @@ function log(...parts) {
 // ---------------------------------------------------------------------------
 function httpJson(urlName) {
   return new Promise((resolve, reject) => {
-    http.get(urlName, (res) => {
+    const req = http.get(urlName, (res) => {
       let data = '';
-      res.on('data', (c) => (data += c));
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
-      });
-    }).on('error', reject);
+      res.on('data', (c) => { data += c; if (data.length > 1024 * 1024) req.destroy(new Error('CDP response too large')); });
+      res.on('error', reject);
+      res.on('end', () => { try { if (res.statusCode !== 200) throw new Error('CDP HTTP status'); resolve(JSON.parse(data)); } catch (e) { reject(e); } });
+    });
+    const timer = setTimeout(() => req.destroy(new Error('CDP HTTP timeout')), 3000);
+    req.on('close', () => clearTimeout(timer)); req.on('error', reject);
   });
 }
 
 async function ensureBrowser() {
-  // 已有我们的调试端口就直接连（保留登录态，避免重复开窗口）
-  try { return await httpJson(`http://127.0.0.1:${port}/json/version`); } catch { /* not running */ }
+  const marker = path.join(profileDir, 'campus-browser-session.json');
+  let existing;
+  try { existing = await httpJson(`http://127.0.0.1:${port}/json/version`); } catch { /* not running */ }
+  if (existing) {
+    let owned;
+    try { owned = JSON.parse(fs.readFileSync(marker, 'utf8')); } catch {}
+    if (!owned || owned.endpoint !== existing.webSocketDebuggerUrl || owned.profile !== path.resolve(profileDir)) {
+      throw new Error('调试端口已被其他或旧版会话占用；请关闭该独立浏览器后重跑，或设置另一个 CAMPUS_BROWSER_PORT');
+    }
+    // 已有浏览器若代理模式与本次要求不一致，无法在运行中改变；提示关闭后重跑
+    if (Boolean(owned.noProxy) !== Boolean(args.noProxy)) {
+      throw new Error('现有独立浏览器的代理模式与本次不同（' + (owned.noProxy ? '直连' : '系统代理') + '）；请关闭该独立浏览器后重跑，或用 --no-proxy 保持一致');
+    }
+    return existing;
+  }
   const flags = [
+    '--remote-debugging-address=127.0.0.1',
     `--remote-debugging-port=${port}`,
     `--user-data-dir=${profileDir}`,
     '--no-first-run',
     '--no-default-browser-check',
     '--disable-features=msEdgeFirstRunExperience',
     '--window-size=1280,900',
+    '--start-maximized',
     '--lang=zh-CN',
   ];
+  // 校园网直连（绕过 Clash/VPN 系统代理）：机构 IP 授权只对校园出口有效
+  if (args.noProxy) flags.push('--no-proxy-server');
+  // 让 PDF 直接下载而不是内置预览（否则自动化拿不到文件）
+  flags.push('--disable-pdf-extension');
+  try {
+    const defDir = path.join(profileDir, 'Default');
+    fs.mkdirSync(defDir, { recursive: true });
+    const prefFile = path.join(defDir, 'Preferences');
+    let prefs = {};
+    try { prefs = JSON.parse(fs.readFileSync(prefFile, 'utf8')); } catch { /* 首次启动无文件 */ }
+    prefs.plugins = Object.assign({}, prefs.plugins, { always_open_pdf_externally: true });
+    prefs.download = Object.assign({}, prefs.download, { prompt_for_download: false, default_directory: outDir });
+    fs.writeFileSync(prefFile, JSON.stringify(prefs));
+  } catch { /* 偏好写入失败不影响下载捕获 */ }
   if (args.headless) flags.push('--headless=new');
   flags.push('about:blank');
-  const child = spawn(browserExe, flags, { stdio: 'ignore', detached: false });
+  const child = spawn(browserExe, flags, { stdio: 'ignore', detached: true });
+  child.on('error', (e) => fail('浏览器启动失败: ' + e.message));
   child.unref();
   const deadline = Date.now() + 25000;
   while (Date.now() < deadline) {
-    try { return await httpJson(`http://127.0.0.1:${port}/json/version`); }
+    try {
+      const version = await httpJson(`http://127.0.0.1:${port}/json/version`);
+      fs.writeFileSync(marker, JSON.stringify({endpoint:version.webSocketDebuggerUrl, profile:path.resolve(profileDir), noProxy:Boolean(args.noProxy)}));
+      return version;
+    }
     catch { await sleep(300); }
   }
   fail('浏览器启动超时（CDP 端口未就绪）');
-}
-
-class Cdp {
-  constructor(ws) {
-    this.ws = ws;
-    this.nextId = 1;
-    this.pending = new Map();
-    this.listeners = [];
-    ws.addEventListener('message', (ev) => {
-      const msg = JSON.parse(ev.data);
-      if (msg.id && this.pending.has(msg.id)) {
-        const { resolve, reject } = this.pending.get(msg.id);
-        this.pending.delete(msg.id);
-        if (msg.error) reject(new Error(JSON.stringify(msg.error)));
-        else resolve(msg.result);
-      } else {
-        this.listeners.slice().forEach((fn) => fn(msg));
-      }
-    });
-  }
-  send(method, params = {}, sessionId) {
-    const id = this.nextId++;
-    const msg = { id, method, params };
-    if (sessionId) msg.sessionId = sessionId;
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.ws.send(JSON.stringify(msg));
-    });
-  }
-  close() { try { this.ws.close(); } catch { /* noop */ } }
 }
 
 // 在页面里执行表达式
@@ -211,6 +252,7 @@ const DOM_PROBE = `(() => {
     textLinks: textLinks.slice(0, 20),
     metas: metas.slice(0, 5),
     bodyText,
+    passwordEl: Array.from(document.querySelectorAll('input[type=password]')).some(el => el.getBoundingClientRect().width > 0),
     captchaEl: (() => {
       const nodes = Array.from(document.querySelectorAll(
         '[class*="captcha"],[id*="captcha"],[class*="puzzle"],[class*="slide-verify"],[class*="verify-slider"]'));
@@ -225,7 +267,7 @@ const DOM_PROBE = `(() => {
         return (t === '向右滑动完成验证' || t === '请完成安全验证' || t === '拖动滑块完成验证');
       });
     })(),
-    needUser: /(安全验证|滑块|拖动滑块|验证码|请完成验证|verify|captcha|sign in|登录后|institution)/i.test(bodyText)
+    needUser: /(安全验证|滑块|拖动滑块|验证码|请完成验证|verify you are human|captcha)/i.test(bodyText)
       || /(verify|captcha|login)/i.test(location.href),
   };
 })()`;
@@ -234,12 +276,23 @@ const DOM_PROBE = `(() => {
 async function fetchPdfInPage(cdp, sessionId, url, maxBytes = 60 * 1024 * 1024) {
   const expr = `(async () => {
     try {
-      const r = await fetch(${JSON.stringify(url)}, { credentials: 'include', redirect: 'follow' });
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 20000);
+      let r;
+      try { r = await fetch(${JSON.stringify(url)}, { credentials: 'include', redirect: 'follow', signal: controller.signal }); } catch (e) { clearTimeout(timer); throw e; }
       const ctype = r.headers.get('content-type') || '';
-      if (!r.ok) return { status: r.status, ctype };
-      const buf = await r.arrayBuffer();
-      if (buf.byteLength > ${maxBytes}) return { status: r.status, ctype, tooBig: true, len: buf.byteLength };
-      const u8 = new Uint8Array(buf);
+      if (!r.ok) { clearTimeout(timer); return { status: r.status, ctype }; }
+      const reader = r.body.getReader(), chunks = []; let length = 0;
+      try {
+        while (true) {
+          const {done, value} = await reader.read(); if (done) break;
+          length += value.length;
+          if (length > ${maxBytes}) { controller.abort(); return {tooBig:true}; }
+          chunks.push(value);
+        }
+      } finally { clearTimeout(timer); }
+      const u8 = new Uint8Array(length); let pos = 0;
+      for (const chunk of chunks) { u8.set(chunk, pos); pos += chunk.length; }
       let bin = '';
       const chunk = 0x8000;
       for (let i = 0; i < u8.length; i += chunk) {
@@ -255,36 +308,33 @@ async function fetchPdfInPage(cdp, sessionId, url, maxBytes = 60 * 1024 * 1024) 
 
 function writePdfFromBase64(b64, suggestedName) {
   const buf = Buffer.from(b64, 'base64');
-  if (buf.length < 1024 || buf.slice(0, 5).toString('latin1') !== '%PDF-') return null;
-  const safe = (suggestedName || 'paper').replace(/[\\\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 90) || 'paper';
+  if (buf.length > 60 * 1024 * 1024 || buf.slice(0, 5).toString() !== '%PDF-' || !buf.subarray(-4096).includes(Buffer.from('%%EOF'))) return null;
+  const safe = ('paper_' + (suggestedName || 'paper')).replace(/[\\\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 90) || 'paper';
   let target = path.join(outDir, safe.endsWith('.pdf') ? safe : safe + '.pdf');
   let n = 2;
   while (fs.existsSync(target)) {
     target = path.join(outDir, path.basename(safe, path.extname(safe)) + '_' + n + '.pdf');
     n++;
   }
-  fs.writeFileSync(target, buf);
+  fs.writeFileSync(target, buf, {flag:'wx'});
   return { path: target, bytes: buf.length };
 }
 
 async function waitForNewFile(before, timeoutMs) {
-  // 下载可能先出现 .crdownload 再改名，给足时间（至少 90 秒）
-  const deadline = Date.now() + Math.max(timeoutMs, 90000);
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    await sleep(1000);
-    const files = fs.readdirSync(outDir);
-    const pdfs = files.filter((f) => f.toLowerCase().endsWith('.pdf'));
-    for (const f of pdfs) {
-      const full = path.join(outDir, f);
-      if (before.includes(full)) continue;
-      const st = fs.statSync(full);
-      if (st.size > 1024) return { path: full, bytes: st.size };
+    await sleep(500);
+    for (const item of downloadEvents.values()) {
+      if (item.state !== 'completed' || !item.suggestedFilename) continue;
+      const full = path.join(outDir, path.basename(item.suggestedFilename));
+      if (before.includes(full) || !basicPdf(full)) continue;
+      return { path: full, bytes: fs.statSync(full).size };
     }
   }
   return null;
 }
 
-// 用浏览器 Cookie + Referer 走普通 HTTP 下载（绕过新标签页 Referer 丢失 / 防外链）
+// 用浏览器 Cookie + Referer 走普通 HTTP 下载（绕过 ScienceDirect pdfft / CNKI bar 等防外链逻辑）
 function cookieHeaderFor(cookies, hostname) {
   return (cookies || [])
     .filter((c) => {
@@ -295,44 +345,46 @@ function cookieHeaderFor(cookies, hostname) {
     .join('; ');
 }
 
-function httpDownload(url, headers, redirects = 6) {
+function httpDownload(target, headers, redirects = 6) {
   return new Promise((resolve) => {
-    const attempt = (target, left) => {
+    const attempt = (url, left) => {
       if (left < 0) { resolve({ error: 'too many redirects' }); return; }
-      const mod = target.startsWith('https:') ? https : http;
+      const mod = url.startsWith('https:') ? https : http;
       let req;
       try {
-        req = mod.get(target, { headers }, (res) => {
+        req = mod.get(url, { headers }, (res) => {
           if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
             res.resume();
-            attempt(new URL(res.headers.location, target).href, left - 1);
+            const next = new URL(res.headers.location, url);
+            if (url.startsWith('https:') && next.protocol !== 'https:') { resolve({error:'HTTPS downgrade refused'}); return; }
+            headers = Object.fromEntries(Object.entries(headers).filter(([key]) => !/^(cookie|authorization|proxy-authorization)$/i.test(key)));
+            attempt(next.href, left - 1);
             return;
           }
           const chunks = [];
-          res.on('data', (c) => chunks.push(c));
+          let bytes = 0;
+          res.on('data', (c) => { bytes += c.length; if (bytes > 60 * 1024 * 1024) { req.destroy(); resolve({error:'PDF exceeds size limit'}); } else chunks.push(c); });
+          res.on('error', () => resolve({error:'response interrupted'}));
           res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
         });
-      } catch (e) {
-        resolve({ error: e.message });
-        return;
-      }
+      } catch (e) { resolve({ error: e.message }); return; }
       req.on('error', (e) => resolve({ error: e.message }));
       req.setTimeout(60000, () => { req.destroy(); resolve({ error: 'timeout' }); });
     };
-    attempt(url, redirects);
+    attempt(target, redirects);
   });
 }
 
 // ---------------------------------------------------------------------------
 // 主流程
 // ---------------------------------------------------------------------------
-(async () => {
   const version = await ensureBrowser();
   log('浏览器:', version.Browser);
   const ws = new WebSocket(version.webSocketDebuggerUrl);
   await new Promise((res, rej) => {
-    ws.addEventListener('open', res);
-    ws.addEventListener('error', () => rej(new Error('CDP WebSocket 连接失败')));
+    const timer = setTimeout(() => { ws.close(); rej(new Error('CDP WebSocket 超时')); }, 10000);
+    ws.addEventListener('open', () => { clearTimeout(timer); res(); });
+    ws.addEventListener('error', () => { clearTimeout(timer); rej(new Error('CDP WebSocket 连接失败')); });
   });
   const cdp = new Cdp(ws);
   await cdp.send('Browser.setDownloadBehavior', {
@@ -344,6 +396,14 @@ function httpDownload(url, headers, redirects = 6) {
   await cdp.send('Page.enable', {}, sessionId);
   await cdp.send('Runtime.enable', {}, sessionId);
   await cdp.send('Network.enable', {}, sessionId);
+  const frameTree = await cdp.send('Page.getFrameTree', {}, sessionId);
+  const addFrames = (tree) => { if (!tree) return; ownFrames.add(tree.frame.id); (tree.childFrames || []).forEach(addFrames); };
+  addFrames(frameTree.frameTree);
+  cdp.listeners.push((msg) => {
+    if (msg.sessionId === sessionId && msg.method === 'Page.frameNavigated') ownFrames.add(msg.params.frame.id);
+    if (msg.method === 'Browser.downloadWillBegin' && ownFrames.has(msg.params.frameId)) downloadEvents.set(msg.params.guid, {...msg.params, state:'inProgress'});
+    if (msg.method === 'Browser.downloadProgress' && downloadEvents.has(msg.params.guid)) Object.assign(downloadEvents.get(msg.params.guid), msg.params);
+  });
   // 记录点击后网络层出现的 PDF/下载类请求（不少站点的下载按钮是 JS 触发的）
   const netUrls = [];
   cdp.listeners.push((msg) => {
@@ -370,171 +430,116 @@ function httpDownload(url, headers, redirects = 6) {
     await sleep(4000);
     probe = await evaluate(cdp, sessionId, DOM_PROBE);
   }
+  if (!probe || !/^https?:/i.test(probe.url || '')) throw new Error('文章页导航失败');
   log('页面:', probe.title, '|', probe.url);
 
-  // 检索模式：先在结果页取第一条文献，再进入详情页下载
-  if (args.search) {
-    const found = await evaluate(cdp, sessionId, `(() => {
-      const links = Array.from(document.querySelectorAll('a[href]')).filter((a) =>
-        /(kcms2\\/article\\/abstract|\\/periodical\\/|Qikan\\/Article\\/Detail)/i.test(a.href));
-      const a = links.find((x) => (x.textContent || '').replace(/\\s+/g, '').length > 4);
-      return a ? { href: a.href, title: (a.textContent || '').replace(/\\s+/g, ' ').trim() } : null;
-    })()`);
-    let detailUrl = found && found.href ? found.href : '';
-    let detailTitle = found && found.title ? found.title : '';
-
-    // 万方：结果项里带 periodical_<id> 文本，拼详情页 URL
-    if (!detailUrl && /wanfang/i.test(probe.url)) {
-      const item = await evaluate(cdp, sessionId, `(() => {
-        const area = Array.from(document.querySelectorAll('[class*="title-area"]')).find((el) =>
-          /(periodical|thesis|conference)_[A-Za-z0-9-]{5,}/.test(el.textContent || ''));
-        if (!area) return null;
-        const m = (area.textContent || '').match(/(periodical|thesis|conference)_([A-Za-z0-9-]{5,})/);
-        if (!m) return null;
-        const t = area.querySelector('[class*="title"]');
-        return { kind: m[1], id: m[2], raw: m[0], title: t ? (t.textContent || '').trim() : '' };
-      })()`);
-      if (item) {
-        detailUrl = `https://d.wanfangdata.com.cn/${item.kind}/${item.id}`;
-        detailTitle = item.title || '';
-        log('万方命中:', item.raw, '->', detailUrl);
-      }
-    }
-
-    if (detailUrl) {
-      args.url = detailUrl;
-      args.title = args.title || detailTitle.replace(/\s*-\s*中国知网\s*$/, '');
-      log('检索命中:', args.title, '|', detailUrl.slice(0, 120));
-      await cdp.send('Page.navigate', { url: detailUrl }, sessionId);
-      await sleep(4500);
-      probe = await evaluate(cdp, sessionId, DOM_PROBE);
-      log('详情页:', probe.title, '|', probe.url);
-      args._found = true;
-    } else {
-      log('检索结果里没找到文献链接（可能需要登录/验证或页面结构变了）');
-    }
+  let credentialFill = null;
+  let credentialFillAttempted = false;
+  async function attemptCredentialFill() {
+    if (credentialFillAttempted || !loginCredentials || !probe || !probe.passwordEl || !approvedOrigin(probe.url)) return;
+    // At most one fill/submit attempt, including after a user clicks the CAS entry.
+    credentialFillAttempted = true;
+    credentialFill = await fillLogin(cdp, sessionId, loginCredentials);
+    log('本机凭据处理:', credentialFill.status);
+    if (credentialFill.status === 'credentials_filled') log('账号密码已填入学校页面；请完成验证码/扫码并点击登录。');
   }
-  if (args.search && !args._found) {
-    const payload = { status: 'no_pdf_found', url: probe.url, title: probe.title,
-                      note: '检索结果未解析出文献链接；可改用 --url 直接给文章页，或先用 --dump 排查页面结构' };
-    console.log(JSON.stringify(payload));
-    cdp.close();
-    process.exit(3);
-  }
-
-  // --dump：只诊断页面（标题/正文/PDF 候选链接），不下载，便于排查站点结构
-  if (args.dump) {
-    const extra = await evaluate(cdp, sessionId, `(() => ({
-      bodyText: (document.body ? document.body.innerText : '').slice(0, 2500),
-      links: Array.from(document.querySelectorAll('a[href]')).slice(0, 80).map((a) => ({
-        t: (a.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 60), h: a.href,
-      })),
-      inputs: Array.from(document.querySelectorAll('input')).slice(0, 20).map((i) => ({
-        id: i.id, name: i.name, type: i.type, placeholder: i.placeholder,
-      })),
-      articles: Array.from(document.querySelectorAll('a[href]'))
-        .filter((a) => /kcms|detail|abstract/i.test(a.href))
-        .slice(0, 15)
-        .map((a) => ({ t: (a.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 70), h: a.href })),
-      tables: Array.from(document.querySelectorAll('table')).slice(0, 5).map((t) => ({
-        cls: t.className, rows: t.querySelectorAll('tr').length,
-      })),
-      items: Array.from(document.querySelectorAll('[class*="wf-list-item"],[class*="list-item"],[class*="result-item"]'))
-        .slice(0, 2)
-        .map((el) => el.outerHTML.slice(0, 2500)),
-      downloadSnippets: (() => {
-        const els = Array.from(document.querySelectorAll('*'))
-          .filter((el) => (el.textContent || '').replace(/\\s+/g, '') === '下载全文');
-        return els.slice(0, 2).map((el) => {
-          const chain = [];
-          let cur = el;
-          for (let i = 0; i < 5 && cur; i++) { chain.push(cur.outerHTML.slice(0, 800)); cur = cur.parentElement; }
-          return chain;
-        });
-      })(),
-      titleNodes: Array.from(document.querySelectorAll('[class*="title"],[class*="name"]'))
-        .filter((el) => {
-          const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
-          return t.length >= 4 && t.length <= 80 && /深度|学习|算法|研究|基于/.test(t);
-        })
-        .slice(0, 10)
-        .map((el) => ({ tag: el.tagName, cls: (el.className || '').toString().slice(0, 70),
-          t: (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 60) })),
-      idHints: (() => {
-        const html = document.documentElement.innerHTML;
-        const out = [];
-        const re = /(?:periodical|thesis|conference|d\\.wanfangdata\\.com\\.cn)\\?[/:=]["']?([A-Za-z0-9_\\-]{6,})/g;
-        let m;
-        while ((m = re.exec(html)) && out.length < 12) out.push(m[0]);
-        const attrs = Array.from(document.querySelectorAll('[data-id],[data-doi],[data-docid],[data-recordid]'))
-          .slice(0, 8)
-          .map((el) => ({ tag: el.tagName, cls: (el.className || '').toString().slice(0, 50),
-            id: el.getAttribute('data-id') || el.getAttribute('data-doi') || el.getAttribute('data-docid') || el.getAttribute('data-recordid') }));
-        return { urlMatches: out, attrs };
-      })(),
-      actions: Array.from(document.querySelectorAll('a,button,li,div,span'))
-        .filter((el) => {
-          const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
-          return t.length > 0 && t.length < 30 && /(PDF|CAJ|下载|全文|HTML)/i.test(t);
-        })
-        .slice(0, 40)
-        .map((el) => ({
-          tag: el.tagName,
-          cls: (el.className || '').toString().slice(0, 70),
-          t: (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 30),
-          href: el.href || el.getAttribute('data-href') || '',
-          onclick: (el.getAttribute('onclick') || '').slice(0, 120),
-        })),
-    }))()`);
-    const payload = { status: 'dump', url: probe.url, title: probe.title, ...extra };
-    console.log(JSON.stringify(payload, null, 2));
-    cdp.close();
-    process.exit(0);
-  }
+  await attemptCredentialFill();
 
   // 验证码/滑块/登录墙：先给页面 15 秒自愈（Elsevier 等有 "正在验证您的浏览器…" 中间页），
   // 仍不通过才抛 NEED_USER 并等待用户在可见浏览器窗口里操作。
   // 注意：只认真实的滑块/安全验证（URL 或可见滑块元素），普通登录框里的 "验证码" 字样不算。
-  const hardCheck = (p) => {
-    if (!p) return false;
-    const urlHit = /(verify\/home|captchaType=|captchaId=)/i.test(p.url || '');
-    const textHit = /(请完成安全验证|向右滑动完成验证|拖动滑块|滑块验证)/i.test(p.bodyText || '');
-    // 只认明确的验证页/滑块文案；页面里普通的 "验证码" 登录框、广告位不算
-    return Boolean(urlHit || textHit);
-  };
+  const hardCheck = requiresUser;
+  // Cloudflare Turnstile / "请稍候" 挑战页：必须等页面真正进入文章页，不能因 captchaEl 抖动提前放行
+  const isChallenge = (p) => Boolean(p && (
+    /are you a robot|confirm you are a human|captcha challenge|请验证您是真人|verify (?:that )?you are human|checking your browser|just a moment|请稍候/i
+      .test(`${p.title || ''} ${p.bodyText || ''}`)
+    || /cdn-cgi\/challenge|challenge-platform/i.test(p.url || '')));
+  const needHuman = (p) => Boolean(p && (isChallenge(p) || hardCheck(p)));
+  const hasPdfEntry = (p) => Boolean(p && (
+    (p.pdfAnchors || []).length ||
+    (p.textLinks || []).some((a) => /view\s*pdf|download\s*pdf|pdf\s*下载|下载\s*pdf/i.test(a.text || '')) ||
+    /view\s*pdf/i.test(p.bodyText || '')));
+
   let needUser = false;
-  if (probe && probe.needUser) {
-    for (let i = 0; i < 10 && hardCheck(probe); i++) {
-      await sleep(1500);
-      probe = await evaluate(cdp, sessionId, DOM_PROBE);
-    }
-    if (hardCheck(probe)) {
-      needUser = true;
-      log('验证判定:', JSON.stringify({
-        urlHit: /(verify\/home|captchaType=|captchaId=)/i.test(probe.url || ''),
-        textHit: /(请完成安全验证|向右滑动完成验证|拖动滑块|滑块验证)/i.test(probe.bodyText || ''),
-        captchaEl: probe.captchaEl,
-        url: probe.url,
-      }));
-      try { await cdp.send('Page.bringToFront', {}, sessionId); } catch { /* noop */ }
-      log('NEED_USER: 页面需要验证码/滑块/登录，请在弹出的浏览器窗口完成；完成后自动继续');
-      const waitDeadline = Date.now() + args.waitUser * 1000;
-      while (Date.now() < waitDeadline) {
-        await sleep(2000);
-        probe = await evaluate(cdp, sessionId, DOM_PROBE);
-        if (!hardCheck(probe)) { needUser = false; break; }
-      }
-      if (needUser) {
-        const payload = { status: 'need_user', url: probe.url, title: probe.title,
-                          note: '验证码/登录未完成；请在浏览器窗口处理后重跑同一命令' };
-        console.log(JSON.stringify(payload));
-        cdp.close();
-        process.exit(4);
-      }
-      log('用户已完成验证，继续');
+  async function waitHumanHere(where) {
+    if (!needHuman(await evaluate(cdp, sessionId, DOM_PROBE))) return true;
+    log('NEED_USER(' + where + '): 需要人机验证/登录，窗口已置前；完成后自动继续（最长 ' + args.waitUser + ' 秒）');
+    try { await cdp.send('Page.bringToFront', {}, sessionId); } catch { /* noop */ }
+    log('若窗口仍被遮挡，请在任务栏打开独立浏览器。');
+    const deadline = Date.now() + args.waitUser * 1000;
+    while (Date.now() < deadline) {
       await sleep(2000);
-      probe = await evaluate(cdp, sessionId, DOM_PROBE);
+      const p = await evaluate(cdp, sessionId, DOM_PROBE);
+      probe = p;
+      await attemptCredentialFill();
+      if (!needHuman(p)) return true;
     }
+    return false;
+  }
+
+  // 统一等待：ScienceDirect 会先显示“请稍候”再渲染文章页；期间出现人机验证就让用户点一次
+  const contentStart = Date.now();
+  const contentDeadline = contentStart + args.timeout * 1000;
+  while (Date.now() < contentDeadline) {
+    if (!needHuman(probe) && hasPdfEntry(probe)) break;
+    if (needHuman(probe)) {
+      needUser = true;
+      const ok = await waitHumanHere('文章页');
+      needUser = false;
+      if (!ok) {
+        console.log(JSON.stringify(sanitize({ status: 'need_user', url: probe.url, title: probe.title,
+          note: '验证未完成；请在浏览器窗口处理后重跑同一命令' })));
+        cdp.close(); process.exit(4);
+      }
+      probe = await evaluate(cdp, sessionId, DOM_PROBE);
+      continue;
+    }
+    const settled = /^https?:/i.test(probe.url || '') && probe.readyState === 'complete'
+      && !/请稍候|are you a robot/i.test(`${probe.title || ''} ${probe.bodyText || ''}`);
+    if (settled && Date.now() - contentStart > 10000) break;
+    await sleep(2000);
+    probe = await evaluate(cdp, sessionId, DOM_PROBE);
+    await attemptCredentialFill();
+  }
+  if (needHuman(probe)) {
+    console.log(JSON.stringify(sanitize({ status: 'need_user', url: probe.url, title: probe.title,
+      note: '页面仍需人机验证/登录；请在浏览器窗口处理后重跑同一命令' })));
+    cdp.close(); process.exit(4);
+  }
+
+  if (args.login) {
+    console.log(JSON.stringify(sanitize({status:'login_unverified', url:probe.url,
+      credential_fill_status:credentialFill ? credentialFill.status : 'not_needed_or_unrecognized_origin',
+      credential_values_returned:false,
+      note:'登录页面阶段已结束或未识别为登录墙；需在同一浏览器打开目标文章核验全文权限，不能据此宣称学校登录和订阅已全部验证'})));
+    cdp.close(); process.exit(3);
+  }
+
+  if (args.dump) {
+    console.log(JSON.stringify(sanitize({status:'dump', title:probe.title, url:probe.url,
+      captcha:requiresUser(probe), links:[...(probe.pdfAnchors || []), ...(probe.textLinks || [])].map(a => ({title:a.text, url:a.href}))}), null, 2));
+    cdp.close(); process.exit(0);
+  }
+  if (args.search) {
+    const results = await evaluate(cdp, sessionId, `(() => {
+      const seen = new Set();
+      return Array.from(document.querySelectorAll('a[href]'))
+        .filter(a => /(kcms2\\/article\\/abstract|\\/periodical\\/|\\/thesis\\/|\\/conference\\/|Qikan\\/Article\\/Detail)/i.test(a.href))
+        .map(a => ({url:a.href, title:(a.textContent || '').replace(/\\s+/g,' ').trim()}))
+        .filter(a => a.title.length > 4 && !seen.has(a.url) && seen.add(a.url)).slice(0,30);
+    })()`);
+    if (!args.select) {
+      console.log(JSON.stringify(sanitize({status:results.length ? 'selection_required' : 'no_results', results,
+        note:'请核对题名，用户选定后用该文章 URL 下载；列表序号可能随页面排序变化。'})));
+      cdp.close(); process.exit(results.length ? 0 : 3);
+    }
+    const selected = results[args.select - 1];
+    if (!selected) throw new Error('--select 超出候选范围；请改用已确认的文章 URL');
+    if (args.title && args.title !== selected.title) throw new Error('搜索排序已变化，选中题名与 --title 不一致；请使用文章 URL');
+    args.title = args.title || selected.title;
+    await cdp.send('Page.navigate', {url:selected.url}, sessionId);
+    await sleep(4000); probe = await evaluate(cdp, sessionId, DOM_PROBE);
+    if (requiresUser(probe)) { console.log(JSON.stringify(sanitize({status:'need_user', url:probe.url, note:'请在原浏览器完成认证，再以文章 URL 重跑'}))); cdp.close(); process.exit(4); }
   }
 
   // 收集候选 PDF 地址：citation_pdf_url > 直接 pdf 链接 > 文本含 PDF/下载 的链接
@@ -542,6 +547,7 @@ function httpDownload(url, headers, redirects = 6) {
   const candidates = [];
   const push = (u) => {
     if (!u || isSiteAsset(u)) return;
+    if (!/^https?:/i.test(new URL(u, probe.url).href)) return;
     const abs = new URL(u, probe.url).href;
     if (!candidates.includes(abs)) candidates.push(abs);
   };
@@ -549,7 +555,17 @@ function httpDownload(url, headers, redirects = 6) {
   (probe.pdfAnchors || []).forEach((a) => push(a.href));
   (probe.downloadAnchors || []).forEach((a) => push(a.href));
   (probe.textLinks || []).forEach((a) => { if (/https?:/.test(a.href)) push(a.href); });
-  log('候选 PDF 链接:', candidates.length);
+  // 过滤干扰项：图片/静态资源，以及不属于本文 PII 的 pdfft（参考文献错链）
+  const pagePii = (probe.url.match(/\/pii\/([A-Za-z0-9]+)/) || [])[1] || '';
+  const filtered = candidates.filter((u) => {
+    if (/\.(?:jpe?g|png|gif|svg|css|js)(?:\?|$)/i.test(u)) return false;
+    if (/\/pdfft(?:\?|$)/i.test(u) && pagePii && !u.toUpperCase().includes(pagePii.toUpperCase())) return false;
+    return true;
+  });
+  filtered.sort((a, b) =>
+    Number(/(\/pdfft|\/pdf\/|\.pdf(?:\?|$))/i.test(b)) - Number(/(\/pdfft|\/pdf\/|\.pdf(?:\?|$))/i.test(a)));
+  candidates.length = 0; candidates.push(...filtered);
+  log('候选 PDF 链接:', candidates.length, candidates.slice(0, 2));
 
   let saved = null;
   const cleanTitle = (t) => (t || '')
@@ -558,19 +574,41 @@ function httpDownload(url, headers, redirects = 6) {
     .trim();
   const nameHint = (cleanTitle(args.title || probe.title) || 'paper') + '.pdf';
 
+  // 0) 直接打开文章 PDF 链接：浏览器已设为“PDF 外部打开”，通常会直接落盘
+  if (!saved && candidates.length) {
+    const direct = candidates.find((u) => /\/pdfft(?:\?|$)/i.test(u)) || candidates.find((u) => /\.pdf(?:\?|$)/i.test(u));
+    if (direct) {
+      const before = fs.readdirSync(outDir).filter((f) => f.toLowerCase().endsWith('.pdf'))
+        .map((f) => path.join(outDir, f));
+      log('尝试直接打开 PDF:', direct.slice(0, 160));
+      await cdp.send('Page.navigate', { url: direct }, sessionId);
+      saved = await waitForNewFile(before, Math.min(90, args.timeout) * 1000);
+      if (!saved) {
+        // PDF 域名（pdf.sciencedirectassets.com 等）可能单独弹 Cloudflare 验证
+        const ok = await waitHumanHere('PDF下载页');
+        if (ok) saved = await waitForNewFile(before, 90000);
+      }
+      if (saved) log('直接导航 PDF 下载成功:', saved.path);
+      else log('直接导航未产生下载（可能被预览/拦截），继续其它方式');
+    }
+  }
+
   // 1) 页面内 fetch（保留登录态/机构 IP 授权，最稳）——只 fetch 同源地址，
   //    跨域下载域（如 bar.cnki.net）会被 CORS 拦住且可能一次作废，交给点击流程。
-  const pageOrigin = (() => { try { return new URL(probe.url).origin; } catch { return ''; } })();
-  for (const url of candidates.slice(0, 8)) {
-    let sameOrigin = false;
-    try { sameOrigin = new URL(url).origin === pageOrigin; } catch { /* ignore */ }
-    if (!sameOrigin) { log('跳过跨域候选（改走点击）:', url.slice(0, 120)); continue; }
-    const res = await fetchPdfInPage(cdp, sessionId, url);
-    if (res && res.b64 && res.b64.length > 1000) {
-      saved = writePdfFromBase64(res.b64, nameHint);
-      if (saved) { log('页面内 fetch 成功:', saved.path); break; }
-    } else {
-      log('fetch 候选失败:', url, JSON.stringify(res).slice(0, 200));
+  //    注意：已通过上一步落盘时跳过，避免用非 PDF 响应覆盖已成功的 saved。
+  if (!saved) {
+    const pageOrigin = (() => { try { return new URL(probe.url).origin; } catch { return ''; } })();
+    for (const url of candidates.slice(0, 8)) {
+      let sameOrigin = false;
+      try { sameOrigin = new URL(url).origin === pageOrigin; } catch { /* ignore */ }
+      if (!sameOrigin) { log('跳过跨域候选（改走点击）:', url.slice(0, 120)); continue; }
+      const res = await fetchPdfInPage(cdp, sessionId, url);
+      if (res && res.b64 && res.b64.length > 1000) {
+        saved = writePdfFromBase64(res.b64, nameHint);
+        if (saved) { log('页面内 fetch 成功:', saved.path); break; }
+      } else {
+        log('fetch 候选失败:', url, JSON.stringify(res).slice(0, 200));
+      }
     }
   }
 
@@ -586,14 +624,15 @@ function httpDownload(url, headers, redirects = 6) {
       const leaf = (el) => !Array.from(el.children).some((ch) => /下载|PDF|全文/i.test(norm(ch.textContent)));
       const inResult = (el) => Boolean(el.closest('[class*="item"],[class*="result"],[class*="list"],[class*="row"]'));
       const pickers = [
-        (el) => /^(PDF\\s*下载|下载\\s*PDF|PDF下载|PDF)$/i.test(norm(el.textContent)),
-        (el) => /^(下载全文|全文下载|CAJ\\s*下载|CAJ下载)$/i.test(norm(el.textContent)),
+        (el) => /^(View\s*PDF|查看\s*PDF)$/i.test(norm(el.textContent)),
+        (el) => /^(PDF\s*下载|下载\s*PDF|PDF下载|PDF)$/i.test(norm(el.textContent)),
+        (el) => /^(下载全文|全文下载)$/i.test(norm(el.textContent)),
         (el) => /^下载$/.test(norm(el.textContent)) && inResult(el),
-        (el) => /下载|download/i.test(norm(el.textContent)) && /btn|button|download|dl|wf-list/i.test(el.className || ''),
+        (el) => /下载|download|view\s*pdf/i.test(norm(el.textContent)) && /btn|button|download|dl|wf-list|pdf/i.test(el.className || ''),
       ];
       let cand = null;
       for (const pick of pickers) {
-        cand = all.find((el) => leaf(el) && pick(el));
+        cand = all.find((el) => leaf(el) && !/full issue|整期/i.test(norm(el.textContent)) && pick(el));
         if (cand) break;
       }
       if (!cand) return null;
@@ -608,7 +647,7 @@ function httpDownload(url, headers, redirects = 6) {
     })()`);
     log('点击候选:', JSON.stringify(clicked));
     if (clicked) {
-      saved = await waitForNewFile(before, Math.min(45, args.timeout));
+      saved = await waitForNewFile(before, Math.min(45, args.timeout) * 1000);
       if (saved) log('下载捕获成功:', saved.path);
     }
 
@@ -627,6 +666,40 @@ function httpDownload(url, headers, redirects = 6) {
     }
   }
 
+  // 2c) 用浏览器 Cookie + Referer 走 HTTP 下载（ScienceDirect pdfft、CNKI bar 等防外链下载器）
+  if (!saved && candidates.length) {
+    const ua = version.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)';
+    for (const u of candidates.slice(0, 6)) {
+      if (!/^https?:/i.test(u)) continue;
+      let hostname = '';
+      try { hostname = new URL(u).hostname; } catch { continue; }
+      if (!u.startsWith('https:')) continue;
+      const allCookies = await cdp.send('Network.getCookies', {urls:[u]}, sessionId).then(r => r.cookies || []).catch(() => []);
+      const res = await httpDownload(u, {
+        'User-Agent': ua,
+        'Referer': probe.url,
+        'Accept': 'application/pdf,text/html;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Cookie': cookieHeaderFor(allCookies, hostname),
+      });
+      const body = res.body;
+      if (body && body.length > 1024 && body.slice(0, 5).toString() === '%PDF-' && body.subarray(-4096).includes(Buffer.from('%%EOF'))) {
+        saved = writePdfFromBase64(body.toString('base64'), nameHint);
+        if (saved) { log('Cookie+Referer 下载成功:', saved.path); break; }
+      } else {
+        log('HTTP 直连失败:', u.slice(0, 120), res.status || res.error, (res.headers && res.headers['content-type']) || '');
+      }
+    }
+  }
+
+  if (!saved) {
+    const current = await evaluate(cdp, sessionId, DOM_PROBE);
+    if (requiresUser(current)) {
+      console.log(JSON.stringify(sanitize({status:'need_user', url:current.url, title:current.title,
+        note:'下载触发了新的验证或登录；请在原浏览器处理，再重跑同一文章命令'})));
+      cdp.close(); process.exit(4);
+    }
+  }
   // 2b) 点击没落盘（新标签/内嵌阅读器）：跟着按钮 href 走，抽 iframe/embed 里的 PDF 地址
   if (!saved && clicked && clicked.href && /^https?:/i.test(clicked.href)) {
     await cdp.send('Page.navigate', { url: clicked.href }, sessionId);
@@ -652,46 +725,12 @@ function httpDownload(url, headers, redirects = 6) {
     }
   }
 
-  // 2c) 用浏览器 Cookie + Referer 走 HTTP 直接下载（CNKI bar、出版社防外链下载器常需这一步）
-  if (!saved && candidates.length) {
-    const allCookies = await cdp.send('Network.getAllCookies').then((r) => r.cookies || []).catch(() => []);
-    const ua = version.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)';
-    for (const u of candidates.slice(0, 4)) {
-      if (!/^https?:/i.test(u)) continue;
-      let hostname = '';
-      try { hostname = new URL(u).hostname; } catch { continue; }
-      const res = await httpDownload(u, {
-        'User-Agent': ua,
-        'Referer': probe.url,
-        'Accept': 'application/pdf,text/html;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-        'Cookie': cookieHeaderFor(allCookies, hostname),
-      });
-      if (res.body && res.body.slice(0, 5).toString('latin1') === '%PDF-') {
-        const buf = res.body;
-        const safe = ((args.title || probe.title || 'paper') + '.pdf').replace(/[\\/:*?"<>|]+/g, ' ').slice(0, 90);
-        let target = path.join(outDir, safe.endsWith('.pdf') ? safe : safe + '.pdf');
-        let n = 2;
-        while (fs.existsSync(target)) {
-          target = path.join(outDir, path.basename(safe, path.extname(safe)) + '_' + n + '.pdf');
-          n++;
-        }
-        fs.writeFileSync(target, buf);
-        saved = { path: target, bytes: buf.length };
-        log('Cookie+Referer HTTP 下载成功:', target);
-        break;
-      }
-      log('HTTP 直连失败:', u.slice(0, 120), res.status || res.error,
-        (res.headers && res.headers['content-type']) || '');
-    }
-  }
-
   // 3) 兜底：直接打开候选 PDF（下载行为已 allow，attachment 会直接落盘）
   if (!saved && candidates.length) {
     const before = fs.readdirSync(outDir).filter((f) => f.toLowerCase().endsWith('.pdf'))
       .map((f) => path.join(outDir, f));
     await cdp.send('Page.navigate', { url: candidates[0] }, sessionId);
-    saved = await waitForNewFile(before, 30);
+    saved = await waitForNewFile(before, 30000);
     if (saved) log('直接导航下载成功:', saved.path);
   }
 
@@ -706,18 +745,18 @@ function httpDownload(url, headers, redirects = 6) {
         authors: [],
         year: null,
         venue: '',
-        identifier: args.doi || probe.url,
-        status: 'downloaded',
+        identifier: args.doi || publicUrl(probe.url),
+        status: 'saved_pending_verification',
         source: 'browser',
         license: null,
         version: null,
-        url: probe.url,
+        url: publicUrl(probe.url),
         path: saved.path,
         bytes: saved.bytes,
         sha256,
         retrieved_at: new Date().toISOString(),
       };
-      fs.appendFileSync(path.join(outDir, 'manifest.jsonl'), JSON.stringify(record) + '\n');
+      fs.appendFileSync(path.join(outDir, 'manifest.jsonl'), JSON.stringify(sanitize(record)) + '\n');
       saved.record = record;
       log('manifest 已追加');
     } catch (e) {
@@ -726,7 +765,7 @@ function httpDownload(url, headers, redirects = 6) {
   }
 
   const payload = {
-    status: saved ? 'downloaded' : (needUser ? 'need_user' : 'no_pdf_found'),
+    status: saved ? 'saved_pending_verification' : (needUser ? 'need_user' : 'no_pdf_found'),
     url: probe.url,
     title: args.title || probe.title,
     saved: saved ? saved.path : null,
@@ -734,10 +773,12 @@ function httpDownload(url, headers, redirects = 6) {
     doi: args.doi || null,
     candidates,
     need_user: needUser,
-    note: saved ? 'PDF 已落盘并写入 manifest.jsonl，可用 paper_oa.py organize 生成索引'
+    note: saved ? (saved.record ? '已保存并登记；请用 pdf_check.py 核验完整性和题名，未核验不算下载完成' : '已保存但清单写入失败，请先补登记并核验')
       : '未拿到 PDF：可能未订阅该刊、页面需要登录/验证，或下载按钮在 iframe 内；可重跑 --wait-user',
   };
-  console.log(JSON.stringify(payload));
+  console.log(JSON.stringify(sanitize(payload)));
   cdp.close();
-  process.exit(saved ? 0 : (needUser ? 4 : 3));
-})().catch((e) => fail('browser_dl 异常: ' + (e && e.message ? e.message : String(e))));
+  process.exit(saved ? (saved.record ? 3 : 1) : (needUser ? 4 : 3));
+}
+if (require.main === module) main().catch(e => { console.log(JSON.stringify(sanitize({status:'error', message:e.message || String(e)}))); process.exit(1); });
+module.exports = {parseArgs};

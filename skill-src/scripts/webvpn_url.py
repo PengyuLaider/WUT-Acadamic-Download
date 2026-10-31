@@ -9,7 +9,7 @@
     其后是 host 的 AES-128-CFB 密文。
 
 只用标准库实现（纯 Python AES-128），不依赖 pycryptodome / cryptography。
-联网本身仍需要 WebVPN 的登录 Cookie（浏览器登录后复制，见 vpn-webvpn.md）。
+访问资源仍需要有效的浏览器会话；不要复制或导出登录 Cookie。
 
 用法：
     python webvpn_url.py https://kns.cnki.net/kcms2/article/abstract?v=xxx
@@ -168,25 +168,34 @@ def host_token(host: str) -> str:
 
 def host_for_token(parts) -> str:
     """从 urlsplit 结果取 token 用的 host：小写 hostname，非默认端口拼成 host:port。"""
-    host = (parts.hostname or "").lower()
+    host = (parts.hostname or "").lower().encode("idna").decode("ascii")
+    if ":" in host:
+        raise ValueError("IPv6 网关重写尚未验证，请从学校入口打开")
     if parts.port and not (
         (parts.scheme == "http" and parts.port == 80)
         or (parts.scheme == "https" and parts.port == 443)
     ):
-        host += f":{parts.port}"
+        raise ValueError("非默认端口路由尚未验证，请从学校入口打开")
     return host
 
 
 def to_webvpn(url: str, base: str = "https://webvpn.whut.edu.cn") -> str:
     """普通 URL -> WebVPN URL。base 形如 https://webvpn.whut.edu.cn。"""
+    gateway = urlsplit(base.strip())
+    if gateway.scheme != "https" or not gateway.hostname or gateway.username or gateway.password or gateway.path not in ("", "/") or gateway.query or gateway.fragment:
+        raise ValueError("base 必须为不含路径、查询和账号信息的 HTTPS 网关地址")
     parts = urlsplit(url.strip())
+    if parts.username or parts.password:
+        raise ValueError("URL 不得包含账号密码")
+    if parts.hostname == gateway.hostname:
+        return url.strip()
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise ValueError(f"需要 http(s) URL：{url!r}")
     scheme = parts.scheme
     host = host_for_token(parts)
     path = parts.path or "/"
     query = f"?{parts.query}" if parts.query else ""
-    return f"{base.rstrip('/')}/{scheme}/{host_token(host)}{path}{query}"
+    return f"{base.rstrip('/')}/{scheme}/{host_token(host)}{path}{query}" + ("#" + parts.fragment if parts.fragment else "")
 
 
 def selftest() -> int:

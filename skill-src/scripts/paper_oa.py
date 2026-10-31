@@ -25,12 +25,16 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import html as html_lib
+from pdf_check import check_bytes, check_file, verified
 import json
 import os
+import math
 import re
 import sys
 import time
 import unicodedata
+import shutil
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,7 +55,7 @@ DEFAULT_CONFIG = {
     "email": "",                      # Unpaywall/Crossref 礼貌联系方式，必填
     "download_dir": "papers",
     "timeout_seconds": 30,
-    "request_interval_seconds": 0.4,  # API 礼貌间隔
+    "request_interval_seconds": 1.0,  # Generic interval; arXiv enforced separately below
     "max_pdf_mb": 120,
     "sources": ["openalex", "crossref", "semanticscholar", "arxiv"],
     "user_agent": DEFAULT_USER_AGENT,
@@ -67,6 +71,9 @@ def now_iso() -> str:
 
 def load_config(path: str | None) -> dict:
     cfg = dict(DEFAULT_CONFIG)
+    cfg["_source_errors"] = []
+    if path and not Path(path).is_file():
+        raise ValueError("指定配置文件不存在")
     candidates = []
     if path:
         candidates.append(Path(path))
@@ -80,12 +87,29 @@ def load_config(path: str | None) -> dict:
             if p.is_file():
                 # utf-8-sig：兼容 Windows 记事本/PowerShell 写入的 BOM
                 data = json.loads(p.read_text(encoding="utf-8-sig"))
-                if isinstance(data, dict):
-                    cfg.update({k: v for k, v in data.items() if v is not None})
+                if not isinstance(data, dict):
+                    raise ValueError("配置必须为 JSON 对象")
+                cfg.update({k: v for k, v in data.items() if v is not None})
                 break
         except (OSError, json.JSONDecodeError) as exc:
-            print(f"[warn] 读取配置失败 {p}: {exc}", file=sys.stderr)
+            raise ValueError(f"配置无法读取: {p.name}") from exc
+    for name in ("timeout_seconds", "max_pdf_mb", "request_interval_seconds"):
+        value = cfg.get(name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} 必须为正数")
     return cfg
+
+
+def public_url(url: str) -> str:
+    parts = parse.urlsplit(url or "")
+    if parts.scheme not in ("http", "https"):
+        return url
+    host = parts.hostname or ""
+    if ":" in host:
+        host = "[" + host + "]"
+    if parts.port:
+        host += ":" + str(parts.port)
+    return parse.urlunsplit((parts.scheme, host, parts.path, "", ""))
 
 
 def ua(cfg: dict) -> str:
@@ -107,10 +131,26 @@ def http_get(
     headers = {"User-Agent": ua(cfg), "Accept": accept}
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
+        host = (parse.urlsplit(url).hostname or "").lower()
+        interval = max(float(cfg.get("request_interval_seconds", 1)),
+                       3.0 if host == "arxiv.org" or host.endswith(".arxiv.org") else 0)
+        last = cfg.setdefault("_last_request_at", {})
+        remaining = interval - (time.monotonic() - last.get(host, -float("inf")))
+        if remaining > 0:
+            time.sleep(remaining)
+        last[host] = time.monotonic()
         req = request.Request(url, headers=headers, method="GET")
         try:
-            with request.urlopen(req, timeout=timeout) as resp:
-                body = resp.read(max_bytes) if max_bytes else resp.read()
+            if not allow_redirects:
+                class NoRedirect(request.HTTPRedirectHandler):
+                    def redirect_request(self, req, fp, code, msg, headers, newurl):
+                        return None
+                opener = request.build_opener(NoRedirect())
+                response = opener.open(req, timeout=timeout)
+            else:
+                response = request.urlopen(req, timeout=timeout)
+            with response as resp:
+                body = resp.read(max_bytes or 8 * 1024 * 1024)
                 return {
                     "status": resp.status,
                     "url": resp.geturl(),
@@ -120,7 +160,7 @@ def http_get(
         except error.HTTPError as exc:
             body = b""
             try:
-                body = exc.read(max_bytes) if max_bytes else exc.read()
+                body = exc.read(max_bytes or 8 * 1024 * 1024)
             except Exception:
                 pass
             result = {
@@ -130,7 +170,14 @@ def http_get(
                 "body": body,
             }
             if exc.code in (429, 500, 502, 503, 504) and attempt < retries:
-                time.sleep(1.5 * (attempt + 1))
+                retry_after = (exc.headers or {}).get("Retry-After", "")
+                delay = 1.5 * (attempt + 1)
+                if retry_after:
+                    # Do not guess HTTP-date delays or wait indefinitely; let the caller retry later.
+                    if not str(retry_after).isdigit() or int(retry_after) > 60:
+                        return result
+                    delay = max(delay, int(retry_after))
+                time.sleep(delay)
                 last_exc = exc
                 continue
             return result
@@ -139,23 +186,29 @@ def http_get(
             if attempt < retries:
                 time.sleep(1.0 * (attempt + 1))
                 continue
-            raise RuntimeError(f"请求失败 {url}: {exc}") from exc
-    raise RuntimeError(f"请求失败 {url}: {last_exc}")
+            raise RuntimeError(f"请求失败 {public_url(url)}: {type(exc).__name__}") from exc
+    raise RuntimeError(f"请求失败 {public_url(url)}: {type(last_exc).__name__}")
 
 
 def http_json(url: str, cfg: dict, *, timeout_note: str = "") -> dict | list | None:
     try:
         res = http_get(url, cfg, accept="application/json")
     except RuntimeError as exc:
+        cfg.setdefault("_source_errors", []).append({"source": timeout_note or "API", "reason": "network_error"})
         print(f"[warn] {timeout_note or 'API'} 请求失败: {exc}", file=sys.stderr)
         return None
     if res["status"] != 200:
-        print(f"[warn] {timeout_note or 'API'} HTTP {res['status']}: {url}", file=sys.stderr)
+        cfg.setdefault("_source_errors", []).append({"source": timeout_note or "API", "status": res["status"]})
+        print(f"[warn] {timeout_note or 'API'} HTTP {res['status']}: {public_url(url)}", file=sys.stderr)
         return None
     try:
-        return json.loads(res["body"].decode("utf-8", "replace"))
-    except json.JSONDecodeError:
-        print(f"[warn] JSON 解析失败: {url}", file=sys.stderr)
+        data = json.loads(res["body"].decode("utf-8", "replace"))
+        if not isinstance(data, dict):
+            raise ValueError("expected JSON object")
+        return data
+    except (json.JSONDecodeError, ValueError):
+        cfg.setdefault("_source_errors", []).append({"source": timeout_note or "API", "reason": "invalid_json"})
+        print(f"[warn] JSON 解析失败: {public_url(url)}", file=sys.stderr)
         return None
 
 
@@ -176,7 +229,9 @@ def normalize_doi(value: str) -> str | None:
         return None
     doi = value.strip()
     doi = re.sub(r"^(https?://(dx\.)?doi\.org/|doi:\s*)", "", doi, flags=re.I)
-    doi = doi.strip().rstrip(".,;)")
+    doi = doi.strip().strip('<>"').rstrip(".,;")
+    while doi.endswith(")") and doi.count(")") > doi.count("("):
+        doi = doi[:-1]
     # 保留原始大小写（10.48550/arXiv.xxxx 依赖大小写），比较时统一 .lower()
     return doi if DOI_RE.match(doi) else None
 
@@ -189,13 +244,16 @@ def classify_identifier(value: str) -> tuple[str, str]:
         return "doi", doi
     low = raw.lower()
     if low.startswith("arxiv:"):
-        return "arxiv", raw.split(":", 1)[1].strip()
+        value = raw.split(":", 1)[1].strip()
+        return ("arxiv", value) if ARXIV_ID_RE.fullmatch(value) else ("unknown", raw)
     if ARXIV_ID_RE.match(raw):
         return "arxiv", raw
     if low.startswith("pmid:"):
-        return "pmid", re.sub(r"\D", "", raw)
+        value = raw.split(":", 1)[1].strip()
+        return ("pmid", value) if value.isdigit() else ("unknown", raw)
     if low.startswith("pmcid:"):
-        return "pmcid", "PMC" + re.sub(r"\D", "", raw)
+        value = raw.split(":", 1)[1].strip().upper().removeprefix("PMC")
+        return ("pmcid", "PMC" + value) if value.isdigit() else ("unknown", raw)
     if re.match(r"^PMC\d+$", raw, re.I):
         return "pmcid", raw.upper()
     if raw.startswith(("http://", "https://")):
@@ -257,7 +315,7 @@ def search_openalex(query: str, cfg: dict, limit: int) -> list[dict]:
             venue=clean_text((loc.get("source") or {}).get("display_name")),
             doi=normalize_doi(item.get("doi") or ""),
             oa=oa.get("is_oa"),
-            oa_url=best.get("url_for_pdf") or best.get("url") or oa.get("oa_url"),
+            oa_url=best.get("pdf_url") or best.get("landing_page_url") or oa.get("oa_url"),
             citations=item.get("cited_by_count"),
             source="openalex",
             id=item.get("id"),
@@ -499,7 +557,7 @@ def unpaywall_locations(doi: str, cfg: dict) -> list[dict]:
 def openalex_locations(work: dict) -> list[dict]:
     locations = []
     for loc in work.get("locations") or []:
-        if not isinstance(loc, dict):
+        if not isinstance(loc, dict) or loc.get("is_oa") is not True:
             continue
         pdf = loc.get("pdf_url")
         landing = loc.get("landing_page_url")
@@ -514,7 +572,7 @@ def openalex_locations(work: dict) -> list[dict]:
                 "is_best": bool(loc.get("is_best_oa_location") or loc.get("is_oa")),
             })
     best = (work.get("best_oa_location") or {})
-    if isinstance(best, dict) and (best.get("pdf_url") or best.get("landing_page_url")):
+    if isinstance(best, dict) and best.get("is_oa") is not False and (best.get("pdf_url") or best.get("landing_page_url")):
         locations.insert(0, {
             "pdf": best.get("pdf_url"),
             "url": best.get("landing_page_url"),
@@ -562,7 +620,13 @@ def europepmc_locations(doi: str | None, pmid: str | None, pmcid: str | None, cf
     locations = []
     for item in ((data or {}).get("resultList") or {}).get("result", []):
         pmcid_found = item.get("pmcid")
-        if not pmcid_found:
+        if not pmcid_found or item.get("isOpenAccess") != "Y":
+            continue
+        if doi and normalize_doi(item.get("doi") or "") and item["doi"].casefold() != doi.casefold():
+            continue
+        if pmcid and pmcid_found.casefold() != pmcid.casefold():
+            continue
+        if pmid and str(item.get("id")) != str(pmid):
             continue
         locations.append({
             "pdf": f"https://europepmc.org/articles/{pmcid_found}?pdf=render",
@@ -673,7 +737,7 @@ def resolve_oa(identifier: str, cfg: dict) -> dict:
             metadata = merge_metadata(metadata, arxiv_meta(arxiv_id, cfg))
     elif arxiv_id:
         locations += arxiv_locations(None, arxiv_id, cfg)
-        metadata = merge_metadata({"title": f"arXiv:{arxiv_id}", "authors": [], "year": None,
+        metadata = merge_metadata({"title": "", "authors": [], "year": None,
                                    "venue": "arXiv", "doi": None}, arxiv_meta(arxiv_id, cfg))
     elif pmid or pmcid:
         locations += europepmc_locations(None, pmid, pmcid, cfg)
@@ -691,7 +755,7 @@ def dedupe_locations(locations: list[dict]) -> list[dict]:
     ordered = sorted(locations, key=lambda loc: (not loc.get("is_best"), not loc.get("pdf")))
     result = []
     for loc in ordered:
-        key = (loc.get("pdf") or loc.get("url") or "").lower()
+        key = loc.get("pdf") or loc.get("url") or ""
         if not key or key in seen:
             continue
         seen.add(key)
@@ -754,34 +818,33 @@ def extract_pdf_url_from_html(html: str, page_url: str) -> list[str]:
         r'<meta[^>]+name=["\']citation_pdf_url["\'][^>]+content=["\']([^"\']+)["\']',
         r'<meta[^>]+content=["\']([^"\']+\.pdf[^"\']*)["\'][^>]+name=["\']citation_pdf_url["\']',
         r'<link[^>]+type=["\']application/pdf["\'][^>]+href=["\']([^"\']+)["\']',
-        r'href=["\']([^"\']+\.pdf(?:\?[^"\']*)?)["\']',
     ]
     for pattern in patterns:
         for match in re.finditer(pattern, html, flags=re.I):
-            candidates.append(parse.urljoin(page_url, match.group(1)))
+            candidates.append(parse.urljoin(page_url, html_lib.unescape(match.group(1))))
     return candidates[:5]
 
 
 def looks_like_pdf(body: bytes) -> bool:
-    return len(body) > 1024 and body[:5] == b"%PDF-"
+    return body.startswith(b"%PDF-") and b"%%EOF" in body[-4096:]
 
 
 def try_download_pdf(url: str, cfg: dict) -> dict:
     """尝试把一个 URL 变成 PDF 字节；失败返回 {ok:False, reason}。"""
-    max_bytes = int(cfg.get("max_pdf_mb", 120)) * 1024 * 1024
+    max_bytes = int(float(cfg.get("max_pdf_mb", 120)) * 1024 * 1024)
     try:
         res = http_get(url, cfg, accept="application/pdf,*/*", max_bytes=max_bytes + 1)
     except RuntimeError as exc:
         return {"ok": False, "reason": str(exc), "tried": url}
     if res["status"] != 200:
-        return {"ok": False, "reason": f"HTTP {res['status']}", "tried": url}
+        return {"ok": False, "status": res["status"], "reason": f"HTTP {res['status']}", "tried": url}
     body = res["body"]
     ctype = (res["headers"].get("content-type") or "").lower()
     if len(body) > max_bytes:
         return {"ok": False, "reason": f"文件超过大小上限（{max_bytes} 字节，见 config.max_pdf_mb）",
                 "tried": url}
     if looks_like_pdf(body):
-        return {"ok": True, "body": body[:max_bytes], "url": res["url"], "content_type": ctype}
+        return {"ok": True, "body": body, "url": res["url"], "content_type": ctype}
     html = body.decode("utf-8", "replace")
     if "citation_pdf_url" in html or ".pdf" in html.lower():
         for candidate in extract_pdf_url_from_html(html, res["url"]):
@@ -789,8 +852,8 @@ def try_download_pdf(url: str, cfg: dict) -> dict:
                 sub = http_get(candidate, cfg, accept="application/pdf,*/*", max_bytes=max_bytes + 1)
             except RuntimeError:
                 continue
-            if sub["status"] == 200 and looks_like_pdf(sub["body"]):
-                return {"ok": True, "body": sub["body"][:max_bytes], "url": sub["url"],
+            if sub["status"] == 200 and len(sub["body"]) <= max_bytes and looks_like_pdf(sub["body"]):
+                return {"ok": True, "body": sub["body"], "url": sub["url"],
                         "content_type": (sub["headers"].get("content-type") or "").lower()}
     return {"ok": False, "reason": f"不是 PDF（Content-Type={ctype or 'unknown'}）", "tried": url}
 
@@ -812,7 +875,9 @@ def read_manifest(manifest: Path) -> list[dict]:
         if not line:
             continue
         try:
-            records.append(json.loads(line))
+            record = json.loads(line)
+            if isinstance(record, dict):
+                records.append(record)
         except json.JSONDecodeError:
             continue
     return records
@@ -828,9 +893,30 @@ def norm_identifier(value: str) -> str:
     return text.rstrip("/").lower()
 
 
+def record_path(record: dict, manifest: Path) -> Path:
+    p = Path(record.get("path") or "__missing__")
+    if p.is_absolute():
+        return p
+    # Legacy records stored paths relative to the original working directory.
+    # Try beside manifest, then its parent, without depending on current cwd.
+    for candidate in (manifest.parent / p, manifest.parent.parent / p):
+        if candidate.is_file():
+            return candidate.resolve()
+    return manifest.parent / p
+
+
+def record_file_valid(record: dict, manifest: Path) -> bool:
+    if not record.get("path") or not record.get("sha256"):
+        return False
+    validation = check_file(record_path(record, manifest), record.get("doi") or "", record.get("title") or "")
+    return validation.get("valid") is True and validation.get("sha256") == record["sha256"]
+
+
 def find_existing(manifest: Path, doi: str | None, identifier: str | None = None) -> dict | None:
     normalized = norm_identifier(identifier) if identifier else ""
-    for record in read_manifest(manifest):
+    for record in reversed(read_manifest(manifest)):
+        if not record_file_valid(record, manifest):
+            continue
         if doi and (record.get("doi") or "").lower() == doi.lower():
             return record
         if normalized:
@@ -841,8 +927,17 @@ def find_existing(manifest: Path, doi: str | None, identifier: str | None = None
 
 
 def fetch_one(identifier: str, cfg: dict, out_dir: Path, *, force: bool = False) -> dict:
+    out_dir = out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    cfg["_source_errors"] = []
     manifest = out_dir / "manifest.jsonl"
+    if not force:
+        kind, value = classify_identifier(identifier)
+        existing = find_existing(manifest, value if kind == "doi" else None, identifier)
+        if existing:
+            validation = check_file(record_path(existing, manifest), existing.get("doi") or "", existing.get("title") or "")
+            status = "exists" if verified(validation) else "saved_pending_verification"
+            return {"status": status, "path": str(record_path(existing, manifest)), "record": existing, "verification": validation}
     resolved = resolve_oa(identifier, cfg)
     if resolved.get("kind") == "unknown":
         return {
@@ -864,7 +959,8 @@ def fetch_one(identifier: str, cfg: dict, out_dir: Path, *, force: bool = False)
     locations = resolved.get("locations") or []
     if not locations:
         return {
-            "status": "no_oa",
+            "status": "source_unavailable" if cfg.get("_source_errors") else "no_oa",
+            "source_errors": list(cfg.get("_source_errors", [])),
             "identifier": identifier,
             "kind": resolved["kind"],
             "doi": doi,
@@ -878,21 +974,30 @@ def fetch_one(identifier: str, cfg: dict, out_dir: Path, *, force: bool = False)
         }
 
     errors = []
+    attempted = set()
+    blocked_hosts = set()
     for loc in locations:
         for key in ("pdf", "url"):
             target = loc.get(key)
-            if not target:
+            if not target or target in attempted or parse.urlsplit(target).netloc in blocked_hosts:
                 continue
+            attempted.add(target)
             outcome = try_download_pdf(target, cfg)
             if not outcome.get("ok"):
-                errors.append({"url": target, "reason": outcome.get("reason")})
+                if outcome.get("status") in (403, 429):
+                    blocked_hosts.add(parse.urlsplit(target).netloc)
+                errors.append({"url": public_url(target), "reason": outcome.get("reason")})
+                continue
+            validation = check_bytes(outcome["body"], doi or "", metadata.get("title") or "")
+            if validation.get("valid") is False:
+                errors.append({"url": public_url(target), "reason": validation.get("reason")})
                 continue
             digest = hashlib.sha256(outcome["body"]).hexdigest()
             if not force:
                 for old in read_manifest(manifest):
-                    if old.get("sha256") == digest:
+                    if old.get("sha256") == digest and record_file_valid(old, manifest):
                         return {
-                            "status": "exists",
+                            "status": "exists" if verified(validation) else "saved_pending_verification",
                             "sha256": digest,
                             "path": old.get("path"),
                             "title": old.get("title") or metadata.get("title"),
@@ -905,19 +1010,22 @@ def fetch_one(identifier: str, cfg: dict, out_dir: Path, *, force: bool = False)
             while destination.exists():
                 destination = out_dir / f"{Path(filename).stem}_{counter}.pdf"
                 counter += 1
-            destination.write_bytes(outcome["body"])
+            # Exclusive creation avoids overwriting another process's completed file.
+            with destination.open("xb") as handle:
+                handle.write(outcome["body"])
             record = {
                 "doi": doi,
                 "title": metadata.get("title") or "",
                 "authors": metadata.get("authors") or [],
                 "year": metadata.get("year"),
                 "venue": metadata.get("venue") or "",
-                "identifier": identifier,
-                "status": "downloaded",
+                "identifier": public_url(identifier),
+                "status": "downloaded" if verified(validation) else "saved_pending_verification",
+                "verification": validation,
                 "source": loc.get("source"),
                 "license": loc.get("license"),
                 "version": loc.get("version"),
-                "url": outcome.get("url"),
+                "url": public_url(outcome.get("url") or ""),
                 "path": str(destination),
                 "bytes": destination.stat().st_size,
                 "sha256": digest,
@@ -950,6 +1058,7 @@ def cmd_search(args, cfg: dict) -> int:
 
 
 def cmd_oa(args, cfg: dict) -> int:
+    cfg["_source_errors"] = []
     resolved = resolve_oa(args.identifier, cfg)
     if resolved.get("kind") == "unknown":
         print(json.dumps({
@@ -960,7 +1069,7 @@ def cmd_oa(args, cfg: dict) -> int:
                          "https://arxiv.org/pdf/1706.03762"],
         }, ensure_ascii=False, indent=2))
         return 2
-    payload = {"status": "ok" if resolved["locations"] else "no_oa", **resolved}
+    payload = {"status": "ok" if resolved["locations"] else ("source_unavailable" if cfg.get("_source_errors") else "no_oa"), "source_errors": cfg.get("_source_errors", []), **resolved}
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0 if resolved["locations"] else 2
 
@@ -985,53 +1094,94 @@ def cmd_batch(args, cfg: dict) -> int:
     out_dir = Path(args.out or cfg.get("download_dir") or "papers").expanduser()
     results = []
     for index, identifier in enumerate(identifiers, start=1):
-        result = fetch_one(identifier, cfg, out_dir, force=args.force)
+        try:
+            result = fetch_one(identifier, cfg, out_dir, force=args.force)
+        except (OSError, ValueError, RuntimeError) as exc:
+            result = {"status": "error", "identifier": public_url(identifier), "reason": type(exc).__name__}
         results.append(result)
         print(f"[{index}/{len(identifiers)}] {result.get('status')}  {identifier}", file=sys.stderr)
-        if result["status"] in ("downloaded", "exists"):
+        if index < len(identifiers):
             polite_sleep(cfg)
+    complete = all(r.get("status") in ("downloaded", "exists") for r in results)
     summary = {
-        "status": "ok",
+        "status": "ok" if complete else "partial",
         "total": len(results),
         "downloaded": sum(1 for r in results if r.get("status") == "downloaded"),
         "exists": sum(1 for r in results if r.get("status") == "exists"),
         "no_oa": sum(1 for r in results if r.get("status") == "no_oa"),
-        "failed": sum(1 for r in results if r.get("status") == "download_failed"),
+        "pending_verification": sum(1 for r in results if r.get("status") == "saved_pending_verification"),
+        "failed": sum(1 for r in results if r.get("status") not in ("downloaded", "exists", "saved_pending_verification", "no_oa")), 
         "results": results,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0
+    return 0 if complete else 1
+
+
+def cmd_import_file(args, cfg: dict) -> int:
+    """Register a user/browser-downloaded file without contacting any website."""
+    source = Path(args.file).expanduser().resolve()
+    validation = check_file(source, args.doi or "", args.title or "", cfg["max_pdf_mb"])
+    if validation.get("valid") is False:
+        print(json.dumps({"status": "invalid_pdf", "verification": validation}, ensure_ascii=False))
+        return 1
+    out = Path(args.out or cfg["download_dir"]).expanduser().resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    manifest = out / "manifest.jsonl"
+    existing = next((r for r in reversed(read_manifest(manifest))
+                     if r.get("sha256") == validation["sha256"] and record_file_valid(r, manifest)), None)
+    destination = record_path(existing, manifest) if existing else source
+    if destination.parent != out:
+        name = build_pdf_name({"title": args.title or source.stem}, args.doi or source.stem)
+        destination = out / name
+        count = 2
+        while destination.exists():
+            destination = out / f"{Path(name).stem}_{count}.pdf"
+            count += 1
+        with source.open("rb") as src, destination.open("xb") as dst:
+            shutil.copyfileobj(src, dst)
+    status = "downloaded" if verified(validation) else "saved_pending_verification"
+    record = {"status": status, "identifier": args.doi or public_url(args.source_url or ""),
+              "doi": normalize_doi(args.doi or ""), "title": args.title or "", "authors": [],
+              "year": None, "source": "local-import", "url": public_url(args.source_url or ""),
+              "path": str(destination), "sha256": validation["sha256"], "bytes": validation["bytes"],
+              "verification": validation, "retrieved_at": now_iso(), "license": None, "version": None}
+    with manifest.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    print(json.dumps(record, ensure_ascii=False, indent=2))
+    return 0 if status == "downloaded" else 3
 
 
 def cmd_organize(args, cfg: dict) -> int:
     target = Path(args.dir).expanduser()
     manifest = target / "manifest.jsonl"
     records = read_manifest(manifest)
+    # Later verification supersedes earlier pending records of the same local file.
+    records = list({str(record_path(r, manifest)): r for r in records}.values())
     if not records:
         print(json.dumps({"status": "empty", "message": f"没有找到 {manifest}"}, ensure_ascii=False))
         return 2
     index_path = target / "index.csv"
-    fields = ["doi", "year", "authors", "title", "venue", "source", "license",
+    fields = ["status", "doi", "year", "authors", "title", "venue", "source", "license",
               "bytes", "path", "retrieved_at", "sha256"]
     missing = []
     with index_path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
-        for record in sorted(records, key=lambda r: (r.get("year") or 0, r.get("title") or ""),
+        for record in sorted(records, key=lambda r: (str(r.get("year") or ""), r.get("title") or ""),
                              reverse=True):
             writer.writerow({**record, "authors": "; ".join(record.get("authors") or [])})
-            file_path = Path(record.get("path") or "")
+            file_path = record_path(record, manifest)
             if record.get("path") and not file_path.exists():
                 missing.append(str(file_path))
     payload = {
-        "status": "ok",
+        "status": "missing_files" if missing else "ok",
         "dir": str(target),
         "records": len(records),
         "index": str(index_path),
         "missing_files": missing,
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0
+    return 1 if missing else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1068,17 +1218,36 @@ def build_parser() -> argparse.ArgumentParser:
     p_organize = sub.add_parser("organize", help="由 manifest.jsonl 生成 index.csv")
     p_organize.add_argument("dir")
     p_organize.set_defaults(func=cmd_organize)
+
+    p_import = sub.add_parser("import-file", help="核验并登记浏览器或人工已下载的 PDF（不联网）")
+    p_import.add_argument("file")
+    p_import.add_argument("--doi", default="")
+    p_import.add_argument("--title", required=True, help="已确认的目标论文题名")
+    p_import.add_argument("--source-url", default="")
+    p_import.add_argument("--out")
+    p_import.set_defaults(func=cmd_import_file)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     sys.setrecursionlimit(10000)
     args = build_parser().parse_args(argv)
-    cfg = load_config(args.config)
+    try:
+        cfg = load_config(args.config)
+    except (OSError, ValueError) as exc:
+        print(json.dumps({"status": "config_error", "reason": str(exc)}, ensure_ascii=False))
+        return 2
     if not cfg.get("email") and args.command in ("search", "oa", "fetch", "batch"):
         print("[warn] 建议在 config.json 填写 email（Crossref/Unpaywall 礼貌标识，能提高成功率）",
               file=sys.stderr)
-    return args.func(args, cfg)
+    if args.command == "search" and not 1 <= args.limit <= 100:
+        print(json.dumps({"status": "invalid_argument", "reason": "--limit 必须为 1..100"}))
+        return 2
+    try:
+        return args.func(args, cfg)
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(json.dumps({"status": "error", "reason": type(exc).__name__}, ensure_ascii=False))
+        return 1
 
 
 if __name__ == "__main__":

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="csrf-token" content="{{CSRF_TOKEN}}"><meta name="demo-mode" content="{{DEMO}}"><meta name="color-scheme" content="light">
+<title>账号配置 · 校园文献助手</title>
+<link rel="icon" href="{{ASSET_PREFIX}}mark.svg" type="image/svg+xml"><link rel="stylesheet" href="{{ASSET_PREFIX}}app.css"><script src="{{ASSET_PREFIX}}app.js" defer></script>
+</head><body>
+<a class="skip-link" href="#account-form">跳到账号配置</a>
+<header class="site-header"><div class="header-inner">
+<a class="brand" href="./" aria-label="校园文献助手首页"><img src="{{ASSET_PREFIX}}mark.svg" width="44" height="44" alt=""><span><strong>校园文献助手</strong><span class="brand-en" lang="en">CAMPUS PAPER ACCESS</span></span></a>
+<div class="header-meta"><span class="school-name">武汉理工大学资源接入</span><span class="local-badge"><span class="status-dot"></span>本机服务</span></div>
+</div></header>
+<main class="page-shell">
+<nav class="breadcrumb" aria-label="当前位置"><span>资源接入</span><span aria-hidden="true">/</span><span aria-current="page">账号配置</span></nav>
+<div class="page-intro"><div><h1>连接校园资源，从这里开始</h1><p>在本机保存校园账号，继续学校认证与论文全文获取。</p></div><div class="intro-note"><span class="tiny-lock" aria-hidden="true"></span><span>凭据仅保存于本机<br><small>配置页面不向学校发送账号密码</small></span></div></div>
+<div class="demo-banner" id="demo-banner" hidden><strong>界面演示</strong><span>可体验配置流程，所有输入仅在当前页面演示，不读取或保存真实账号。</span></div>
+<section class="workspace" aria-label="账号配置与接入流程">
+<section class="form-panel" aria-labelledby="form-heading">
+<div class="panel-heading"><div><span class="section-kicker">校园账号</span><h2 id="form-heading">账号配置</h2></div><span class="state-tag" id="config-tag">正在读取状态</span></div>
+<p class="panel-description">使用智慧理工大的校园卡号或学工号。配置保存后，由本机登录工具在学校页面填入。</p>
+<div class="feedback" id="feedback" role="status" aria-live="polite" tabindex="-1" hidden></div>
+<form id="account-form" novalidate>
+<div class="field"><label for="username">校园账号<span class="required-mark" id="user-required">必填</span></label><input id="username" name="username" type="text" placeholder="请输入校园卡号 / 学工号" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="128" aria-describedby="username-help username-error"><p class="field-help" id="username-help">请输入你用于智慧理工大统一认证的账号。</p><p class="field-error" id="username-error" hidden></p></div>
+<div class="field"><label for="password">登录密码<span class="required-mark" id="password-required">必填</span></label><div class="password-wrap"><input id="password" name="password" type="password" placeholder="请输入智慧理工大密码" autocomplete="off" maxlength="2048" aria-describedby="password-help password-error"><button class="password-toggle" id="password-toggle" type="button" aria-label="显示密码" aria-pressed="false"><svg viewBox="0 0 24 24" width="21" height="21" fill="none" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z" stroke="currentColor" stroke-width="1.5"/><circle cx="12" cy="12" r="2.6" stroke="currentColor" stroke-width="1.5"/><path id="eye-slash" d="m4 4 16 16" stroke="currentColor" stroke-width="1.7" hidden/></svg></button></div><p class="field-help" id="password-help">已保存的密码不会在页面中显示。</p><p class="field-error" id="password-error" hidden></p></div>
+<div class="option-row"><input id="auto-submit" type="checkbox" name="auto_submit"><label for="auto-submit"><strong>无验证码时自动提交一次</strong><span>需要验证码、扫码或短信认证时，仍由你本人完成。</span></label></div>
+<div class="save-row"><button class="primary-button" id="save-button" type="submit"><span id="save-label">保存账号配置</span><svg viewBox="0 0 20 20" width="18" height="18" fill="none" aria-hidden="true"><path d="M4 10h11m-4-4 4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button><span class="save-note">保存配置 ≠ 已通过学校认证</span></div>
+</form>
+<noscript><p class="feedback error">请启用 JavaScript 后使用配置界面，或在本机手动编辑私密配置文件。</p></noscript>
+<details class="storage-details"><summary><span class="tiny-lock" aria-hidden="true"></span>了解配置如何保存</summary><div><p>账号密码以明文保存在本机 <code>登录配置.private.json</code>。页面不会返回已保存的账号或密码，也不包含外部字体、统计或第三方脚本。</p><p>不要将该文件提交到 GitHub。导出发布包时仅包含空白示例配置。</p></div></details>
+</section>
+<aside class="journey-panel" aria-labelledby="journey-heading"><div class="journey-top"><h2 id="journey-heading">资源接入流程</h2><p>每一步，状态都清楚。</p></div>
+<ol class="journey-list"><li class="journey-step active" id="step-config"><span class="step-number" aria-hidden="true">1</span><div><div class="step-heading"><h3>保存账号配置</h3><span class="step-state" id="step-config-state">当前步骤</span></div><p>仅保存在本机，供登录工具读取。</p></div></li><li class="journey-step" id="step-auth"><span class="step-number" aria-hidden="true">2</span><div><div class="step-heading"><h3>完成学校认证</h3><span class="step-state" id="step-auth-state">待进行</span></div><p>在学校页面完成验证码、扫码等验证。</p></div></li><li class="journey-step"><span class="step-number" aria-hidden="true">3</span><div><div class="step-heading"><h3>获取与核验全文</h3><span class="step-state">待进行</span></div><p>按 DOI 定位论文，下载后核对题名、版本和 PDF。</p></div></li></ol>
+<div class="next-step" id="next-step"><span class="next-caption">准备好之后</span><h3>继续学校认证</h3><p>运行本机登录入口，沿用同一浏览器完成认证。</p><button class="text-button" id="instructions-button" type="button" aria-expanded="false" aria-controls="login-instructions">查看操作步骤 <span aria-hidden="true">→</span></button><div id="login-instructions" hidden><p>在工具目录打开 PowerShell，运行：</p><code class="command">.\登录图书馆.ps1</code><p>窗口中完成验证码后，继续访问目标论文。校园网直连已有全文权限时可直接下载。</p></div></div>
+<div class="campus-line" aria-hidden="true"><svg viewBox="0 0 340 65" fill="none"><path d="M0 60h340M24 60V28h38v32m-28-23h6m8 0h6m-20 10h6m8 0h6M84 60V23h57v37m-61-37 33-16 33 16H80Zm14 5v29m12-29v29m12-29v29m12-29v29M158 60V39h30v21m-18-15h6M210 60V18h44v42m-34-33h6m12 0h6m-24 11h6m12 0h6m-24 11h6m12 0h6M275 60V32h40v28m-31-19h7m10 0h6m-23 9h7m10 0h6" stroke="currentColor" stroke-width="1.4"/></svg></div>
+</aside></section>
+<section class="service-notes" aria-label="使用提示"><div><span class="note-icon" aria-hidden="true">i</span><p><strong>校园网直连提示</strong><span>学校已授权的网络可能无需账号登录。系统代理可能改变出口，可按实际网络选择直连。</span></p></div><div><span class="note-icon check-icon" aria-hidden="true">✓</span><p><strong>权限与核验提示</strong><span>账号配置和机构名称不代表目标论文有全文权限，请以文章页面和 PDF 核验结果为准。</span></p></div></section>
+</main><footer class="site-footer"><span>Campus Library Papers · 校园文献助手</span><span>独立本机工具，非学校官方认证页面</span></footer>
+</body></html>

@@ -72,7 +72,7 @@ $DefaultSettings = [ordered]@{
         login_markers = @('登录', 'login', '统一身份认证', 'cas')
     }
     auth = [ordered]@{
-        mode = 'cas'                       # cas | manual | form | none
+        mode = 'manual'                       # cas | manual | form | none
         login_url = ''
         manual_open_url = ''
         open_browser_on_manual = $true
@@ -133,12 +133,12 @@ foreach ($k in $DefaultSettings.Keys) { $settings[$k] = $DefaultSettings[$k] }
 
 $configPath = if ($Config) { $Config } elseif (Test-Path -LiteralPath $DefaultConfig) { $DefaultConfig } elseif (Test-Path -LiteralPath $ExampleConfig) { $ExampleConfig } else { '' }
 if ($Config -and -not (Test-Path -LiteralPath $Config)) {
-    Write-Diag "指定的配置文件不存在：$Config；回退到 config.json / config.example.json"
-    $configPath = if (Test-Path -LiteralPath $DefaultConfig) { $DefaultConfig } elseif (Test-Path -LiteralPath $ExampleConfig) { $ExampleConfig } else { '' }
+    throw '指定的配置文件不存在；请检查 -Config 路径'
 }
 if ($configPath) {
     $loaded = Read-JsonFile $configPath
-    if ($loaded) { Merge-Settings $settings $loaded | Out-Null }
+    if (-not $loaded) { throw '配置读取失败，请修复 JSON 后重试' }
+    Merge-Settings $settings $loaded | Out-Null
 }
 $settings._config_path = $configPath
 
@@ -273,10 +273,10 @@ function Get-CaptivePortalState {
             if ($response -and $response.StatusCode) { $item.status = [int]$response.StatusCode }
             $item.error = $_.Exception.Message
             # 强制门户常以 3xx/4xx + 登录页形式出现
-            if ($item.status -in @(301, 302, 303, 307, 308, 401, 403)) { $item.redirected = $true }
+            if ($item.status -in @(301, 302, 303, 307, 308)) { $item.redirected = $true }
         } catch { $item.error = $_.Exception.Message }
         # 只有"被劫持/被要求认证"才算强制门户；单纯探测超时不可达不算，避免误报
-        $portalLike = $item.redirected -or ($item.status -in @(301, 302, 303, 307, 308, 401, 403)) -or ($item.status -eq 200 -and -not $item.ok -and [string]$probe.expect -ne '204')
+        $portalLike = $item.redirected -or ($item.status -in @(301, 302, 303, 307, 308)) -or ($item.status -eq 200 -and -not $item.ok -and [string]$probe.expect -ne '204')
         if ($portalLike) { $state.detected = $true }
         $state.probes += $item
     }
@@ -297,7 +297,7 @@ function Test-CampusProbe($Probe) {
     $item.redirected = $res.redirected
     $item.error = $res.error
     $item.body_head = [string]$res.body_head
-    $body = [string]$res.body_head
+    $body = if ($res.body_full) { [string]$res.body_full } else { [string]$res.body_head }
     $lower = $body.ToLowerInvariant()
 
     foreach ($marker in @($Probe.must_contain)) {
@@ -309,12 +309,13 @@ function Test-CampusProbe($Probe) {
     foreach ($marker in @($Probe.login_markers)) {
         if ($marker -and $lower.Contains(([string]$marker).ToLowerInvariant())) { $item.login_wall = $true }
     }
-    $item.ok = [bool]($res.ok -or ($item.status -and $item.status -lt 500))
-    if ($item.ok) {
-        if ($Probe.must_contain -or $Probe.must_not_contain -or $Probe.login_markers) {
-            $item.authenticated = (-not $item.login_wall) -and ($item.missing_markers.Count -eq 0)
-        } else {
-            $item.authenticated = (-not $item.redirected) -and ($res.status -eq 200)
+    $item.ok = [bool]($res.ok -and $res.status -eq 200)
+    # Public library homepages and negative-marker absence prove reachability only.
+    if ($Probe.proves_campus_access -eq $true -and @($Probe.must_contain).Count -gt 0) {
+        if ($item.ok -and -not $item.redirected -and -not $item.login_wall -and $item.missing_markers.Count -eq 0) {
+            $item.authenticated = $true
+        } elseif ($item.login_wall) {
+            $item.authenticated = $false
         }
     }
     return $item
@@ -326,6 +327,7 @@ function Test-CidrContains([string]$Ip, [string]$Cidr) {
         $parts = $Cidr.Split('/')
         $network = [System.Net.IPAddress]::Parse($parts[0])
         $bits = [int]$parts[1]
+        if ($bits -lt 0 -or $bits -gt ($network.GetAddressBytes().Length * 8)) { return $false }
         $ipBytes = [System.Net.IPAddress]::Parse($Ip).GetAddressBytes()
         $netBytes = $network.GetAddressBytes()
         if ($ipBytes.Length -ne $netBytes.Length) { return $false }
@@ -335,7 +337,7 @@ function Test-CidrContains([string]$Ip, [string]$Cidr) {
         }
         $remaining = $bits % 8
         if ($remaining -gt 0) {
-            $mask = [byte](0xFF -shl (8 - $remaining))
+            $mask = [byte](0xFF -band (0xFF -shl (8 - $remaining)))
             if (($ipBytes[$fullBytes] -band $mask) -ne ($netBytes[$fullBytes] -band $mask)) { return $false }
         }
         return $true
@@ -382,7 +384,7 @@ function Invoke-WebVpnProbe {
         $probe.status = $res.status
         $probe.redirect = $res.final_url
     }
-    if ($probe.status -eq 200) { $probe.logged_in = $true }
+    if ($probe.status -eq 200) { $probe.logged_in = $null } # HTTP 200 alone is not authentication evidence
     elseif ($probe.status -in @(301, 302, 303, 307, 308)) {
         if ($probe.redirect -match '/login') { $probe.logged_in = $false }
     }
@@ -446,7 +448,7 @@ function Get-NetworkStatus {
             foreach ($marker in @($settings.webvpn.login_markers)) {
                 if ($marker -and $bodyLower.Contains(([string]$marker).ToLowerInvariant())) { $hasLogin = $true; break }
             }
-            $vpn.logged_in = -not $hasLogin
+            $vpn.logged_in = $null # This HTTP session is independent of the browser
         }
         # 更强的判据：重写 URL 是否 302 到 /login
         $vpn.probe = Invoke-WebVpnProbe
@@ -461,12 +463,13 @@ function Get-NetworkStatus {
 
     $onCampus = $null
     $authenticatedProbes = @($probes | Where-Object { $_.authenticated -eq $true })
-    if ($authenticatedProbes.Count -gt 0 -or $cidrHits.Count -gt 0) { $onCampus = $true }
+    if ($authenticatedProbes.Count -gt 0) { $onCampus = $true }
     elseif ($probes.Count -gt 0 -and ($probes | Where-Object { $_.authenticated -eq $false -or $_.login_wall })) { $onCampus = $false }
 
     $vpnConnected = $null
-    if ($vpn.logged_in -eq $true) { $vpnConnected = $true }
-    elseif ($vpn.reachable -and $vpn.logged_in -eq $false) { $vpnConnected = $false }
+    # CLI HTTP probes never establish the current browser session status.
+    $vpn.http_probe_logged_in = $vpn.logged_in
+    $vpn.logged_in = $null
 
     $recommendation = 'unknown'
     if ($onCampus -eq $true) { $recommendation = 'direct' }
@@ -474,6 +477,8 @@ function Get-NetworkStatus {
     elseif ($onCampus -eq $false) { $recommendation = 'oa_or_vpn' }
 
     return [ordered]@{
+        probe_scope = 'independent_http_session'
+        browser_session = 'not_observed'
         checked_at = (Get-Date).ToString('o')
         config_path = $settings._config_path
         school = $settings.school.name
@@ -490,9 +495,9 @@ function Get-NetworkStatus {
         public_ip = $publicIp
         proxy = $proxy
         hints = @(
-            'on_campus=true  -> 直接走图书馆/数据库（校内 IP 已授权）',
+            'on_campus=true 仅说明已配置的受限探测页通过；目标论文订阅权限仍需逐篇核验',
             'on_campus=false -> 优先 CARSI（carsi.portal）按库做机构登录；WebVPN 作备选；纯 OA 论文可直接脚本下载',
-            'on_campus=false 且 vpn_connected=false -> 需要 WebVPN 时先引导用户登录，再重写数据库 URL',
+            'vpn_connected=null：脚本不能判断浏览器会话；用户已登录时直接继续原浏览器，不重复要求登录',
             'on_campus=null -> 探测页无法判断，请人工确认或补充 on_campus_probes / campus_cidrs'
         )
     }
@@ -578,7 +583,7 @@ function Invoke-Login {
             login_url = $target
             browser_opened = $opened
             hint = $auth.manual_verify_hint
-            next_step = '请在浏览器完成登录并保持登录状态，回复“已登录”后再运行 -Action status 验证。'
+            next_step = '请在浏览器完成登录并保持登录状态，回复“已登录”后在同一浏览器访问目标论文核验权限。'
         }
     }
     $cred = Get-CredentialPair

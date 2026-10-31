@@ -1,0 +1,12 @@
+{
+  "schema": "light.visual_qa.v1",
+  "verdict": "pass",
+  "pixel_review_done": false,
+  "pixel_review_note": "未做像素级回看(无渲染器或未喂回多模态模型),仅几何+对比度检测;视觉品味/层次/可读性细节未经验证",
+  "counts": {
+    "critical": 0,
+    "important": 0,
+    "total": 0
+  },
+  "issues": []
+}
