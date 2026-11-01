@@ -3,7 +3,8 @@
 const fs = require('fs');
 const path = require('path');
 const ALLOWED_ORIGINS = new Set(['https://webvpn.whut.edu.cn', 'https://zhlgd.whut.edu.cn']);
-const DEFAULT_FILE = path.resolve(__dirname, '../../登录配置.private.json');
+const packageRoot=path.resolve(__dirname,'../..');
+const DEFAULT_FILE=process.env.CAMPUS_CREDENTIALS || (fs.existsSync(path.join(packageRoot,'campus_portal.py'))?path.join(packageRoot,'登录配置.private.json'):'');
 const SELECTORS = {
   username: 'input[name="un"],input#un,input[name="username"],input#username,input[autocomplete="username"]',
   password: 'input[type="password"]',
@@ -17,6 +18,7 @@ function approvedOrigin(value) {
 }
 
 function readCredentials(file = DEFAULT_FILE) {
+  if(!file)throw new Error('credential_path_required_use_explicit_config');
   let value;
   try { value = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')); }
   catch { throw new Error('credential_file_unreadable_or_invalid_json'); }

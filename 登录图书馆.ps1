@@ -9,8 +9,7 @@ $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 if (-not $ConfigPath) { $ConfigPath = Join-Path $PSScriptRoot '登录配置.private.json' }
 $nodeExe = $null
-$bundledNode = Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe'
-foreach ($candidate in @($env:CAMPUS_NODE,$bundledNode,'node')) {
+foreach ($candidate in @($env:CAMPUS_NODE,'node')) {
     if (-not $candidate) { continue }
     $command = Get-Command $candidate -ErrorAction SilentlyContinue
     if (-not $command) { continue }

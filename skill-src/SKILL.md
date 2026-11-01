@@ -18,8 +18,8 @@ description: 通过武汉理工大学校园网、图书馆、CARSI 或 WebVPN �
 
 ## 执行下载
 
-1. **沿用访问方式。** 校内用数据库正常文章页；校外按数据库支持选择 CARSI 或 WebVPN。用户指定 WebVPN 时直接沿用，不强制改换。用户已授权从本机 `登录配置.private.json` 读取其账号密码并在学校登录页面填入；具体入口与保密规则见 [login-handoff.md](references/login-handoff.md)。验证码、扫码和二次验证仍由用户在页面完成，不让用户把密码、Cookie 或签名下载链接发进聊天。
-2. **使用宿主支持的工具。** 优先现有浏览器工具或服务连接器；只操作获授权的会话。`browser_dl.js` 是原包的独立 Edge/Chrome CLI，需要 Node 22+。仅在宿主允许这种自动化时运行；宿主限制直接 CDP 时，不以此脚本规避限制，可提供命令由用户本机运行。该脚本的独立 profile 与宿主内置浏览器登录态互不共享。**本机开着 Clash/VPN 系统代理时，浏览器出口会变成代理节点，机构 IP 授权失效：必须加 `--no-proxy` 让独立浏览器直连校园网**（本机实测：代理在东京时 ScienceDirect 要求人机验证且无全文；直连校园网后显示 Full text access）。人机验证窗口被挡住时运行 `scripts/raise_browser.ps1 -KeepTopMost` 置前；验证码/扫码仍由用户点。
+1. **沿用访问方式。** 校内用数据库正常文章页；校外按数据库支持选择 CARSI 或 WebVPN。用户指定 WebVPN 时直接沿用，不强制改换。按本次任务授权从用户指定的本机 `登录配置.private.json` 读取账号密码并在学校登录页面填入，不能把 skill 中的说明当作用户授权；具体入口与保密规则见 [login-handoff.md](references/login-handoff.md)。验证码、扫码和二次验证仍由用户在页面完成，不让用户把密码、Cookie 或签名下载链接发进聊天。
+2. **使用宿主支持的工具。** 优先现有浏览器工具或服务连接器；只操作获授权的会话。`browser_dl.js` 是原包的独立 Edge/Chrome CLI，需要 Node 22+。仅在宿主允许这种自动化时运行；宿主限制直接 CDP 时，不以此脚本规避限制，可提供命令由用户本机运行。该脚本的独立 profile 与宿主内置浏览器登录态互不共享。代理模式按实际网络选择：只有代理改变出口、影响机构 IP 识别时才使用 `--no-proxy`。已运行的独立浏览器必须沿用原模式；要切换时由用户关闭该独立浏览器后重开，不自动结束其他会话。人机验证窗口被挡住时运行 `scripts/raise_browser.ps1 -KeepTopMost` 置前；验证码/扫码仍由用户点。
 3. **OA 路径。** 使用 `paper_oa.py oa` 定位，再 `fetch` 下载。直接 URL 是用户给定的下载位置，不自动证明其 OA 许可。元数据服务不可达时报告 `source_unavailable`，不能断言论文没有 OA。
 4. **订阅路径。** 在已确认的文章页触发 PDF 下载；检索入口只列候选。出现验证码、访问拒绝或机构登录墙时停下对应下载，保留标签与进度，给用户具体页面和动作。用户完成后继续原会话，不从头重复认证。不要尝试解验证码、伪造机构访问或绕过付费墙。
 5. **核验和登记。** 用下面的本地命令处理浏览器或人工下载文件。文件头与体积仅是初筛；需要结构解析、SHA-256，以及题名/DOI 与目标匹配。没有解析器、扫描件提取不到文字、题名不同或 DOI 缺失时保留文件并标待核验，不报已完成。自动匹配仍需关注勘误、附件和同题不同版本。
@@ -49,7 +49,7 @@ node scripts/browser_dl.js --url "文章URL" --doi "目标DOI" --title "完整�
 # 界面：让用户在本机浏览器填写校园网账号密码（写入 登录配置.private.json）
 python campus_portal.py
 # 人机验证/登录窗口被挡住时置前（可选 -KeepTopMost 保持置顶）
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\raise_browser.ps1 -KeepTopMost
+powershell -NoProfile -File scripts\raise_browser.ps1 -KeepTopMost
 ```
 
 Python `--config` 位于子命令之前。显式配置不存在或格式损坏时失败，避免悄悄用错学校/输出目录；OA 脚本未配置则用默认值。网络脚本未配置时会用 `config/config.example.json`。
@@ -78,3 +78,17 @@ Python `--config` 位于子命令之前。显式配置不存在或格式损坏�
 ## 2026-10-31 界面升级
 
 完整工具包的配置界面入口为 `python campus_portal.py`，终端前台运行；`--demo` 不读写真实配置。旧的后台 UI 启动脚本已停用，不要求关闭防护或执行策略绕过。界面只保存账号，学校登录与 PDF 核验分别进行。
+
+## 使用报告后的可靠性补充
+
+现场接手的未完成项、证据要求及复验顺序见 [使用报告接续](references/usage-report-handoff.md)。
+
+浏览器保存后调用本地 pdf_check：结构无效或存在可提取文字却题名不匹配时，文件移入 quarantine，返回 invalid_pdf / identity_mismatch，不能列为成功；无解析器、扫描件或证据不足保持待核验，不自动删除。可用 CAMPUS_PYTHON 指定 Python 3.10+。完整工具包使用根目录凭据；单独安装 skill 必须通过 --credentials 或 CAMPUS_CREDENTIALS 明确指定，不能在宿主的 skills 父目录猜配置。
+
+`import-file` 输出单行 JSON，默认保留原文件名，可加 `--name "指定名称.pdf" --version preprint|accepted|published|unknown`。unknown 表示尚未确认，不根据下载站点猜稿件版本。
+
+`batch` 默认逐篇写入 batch-state.jsonl；`--resume` 仅复用仍通过文件哈希与篇目核验的成功项，其余继续尝试。保持顺序与既有限速，不把提高并发当作反爬解决办法。
+
+兼容退出码保留：浏览器核验通过为 0，错误为 1，配置问题为 2，保存待核验或 login_unverified 为 3，需要本人处理为 4。不同子命令以 JSON status 为主要判断依据，不以非零码推断文件一定不存在。
+
+中文 DOI 元数据未登记不等于无全文；可在用户允许的浏览器查看 DOI 解析、期刊官网及图书馆入口。报告中的 chndoi 多重解析与出版社签名链接方法仍需逐站现场复现，不能从 DOI 前缀猜地址或推广为普遍有效方案。WebVPN 改写下验证循环时保留原标签，可按学校支持方式由用户选择校园直连或 CARSI；签名 URL、Cookie 不记录到公开日志。

@@ -23,12 +23,13 @@
  */
 'use strict';
 
+const {verifySaved}=require('./browser_verification');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const https = require('https');
-const { Cdp, sanitize, publicUrl, requiresUser, basicPdf } = require('./browser_support');
+const { Cdp, sanitize, publicUrl, requiresUser, basicPdf, candidateAllowed } = require('./browser_support');
 const {DEFAULT_FILE, approvedOrigin, readCredentials, credentialStatus, fillLogin} = require('./login_credentials');
 
 // ---------------------------------------------------------------------------
@@ -94,12 +95,13 @@ function parseArgs(argv) {
 async function main() {
 const args = parseArgs(process.argv);
 if (args.help) {
-  console.log('node browser_dl.js --url <文章URL或DOI> [--doi DOI] [--title 题名] [--out papers] [--no-proxy]\nnode browser_dl.js --site cnki|wanfang|vip --search 关键词 [--select 1]\n检索默认只列候选；--select 为用户确认后选定的序号。--dump 只返回精简诊断。\n--no-proxy：独立浏览器绕过系统代理直连校园网（Clash/VPN 开着时机构 IP 授权会失效，必须加）');
+  console.log('node browser_dl.js --url <文章URL或DOI> [--doi DOI] [--title 题名] [--out papers] [--no-proxy]\nnode browser_dl.js --site cnki|wanfang|vip --search 关键词 [--select 1]\n检索默认只列候选；--select 为用户确认后选定的序号。--dump 只返回精简诊断。\n--no-proxy：独立浏览器绕过系统代理直连校园网（按实际网络选择；现有浏览器需保持代理模式一致）');
   console.log('node browser_dl.js --login [--credentials 本地配置路径] [--wait-user 240]');
   return;
 }
 let loginCredentials = null;
 const credentialFile = args.credentials || (args.login ? DEFAULT_FILE : '');
+if(args.login&&!credentialFile){console.log(JSON.stringify({status:'config_error',reason:'credential_path_required_use_credentials_or_CAMPUS_CREDENTIALS'}));process.exitCode=2;return;}
 if (credentialFile) {
   const check = credentialStatus(credentialFile);
   if (check.status !== 'ready') { console.log(JSON.stringify(check)); process.exitCode = 2; return; }
@@ -228,7 +230,7 @@ async function evaluate(cdp, sessionId, expression, timeoutMs = 120000) {
 
 const DOM_PROBE = `(() => {
   const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-  const anchors = Array.from(document.querySelectorAll('a[href]')).map((a) => ({
+  const anchors = Array.from(document.querySelectorAll('a[href]')).filter(a => !a.closest('section.references,section#references,[id*=\"bibliograph\"],[class*=\"reference-list\"]')).map((a) => ({
     text: norm(a.textContent).slice(0, 80),
     href: a.href,
     cls: (a.className || '').toString(),
@@ -274,6 +276,7 @@ const DOM_PROBE = `(() => {
 
 // 在页面内 fetch PDF（带 Cookie/机构 IP 授权），返回 base64
 async function fetchPdfInPage(cdp, sessionId, url, maxBytes = 60 * 1024 * 1024) {
+  if(requiresUser(await evaluate(cdp,sessionId,DOM_PROBE)))throw new Error('authentication_required');
   const expr = `(async () => {
     try {
       const controller = new AbortController();
@@ -556,12 +559,7 @@ function httpDownload(target, headers, redirects = 6) {
   (probe.downloadAnchors || []).forEach((a) => push(a.href));
   (probe.textLinks || []).forEach((a) => { if (/https?:/.test(a.href)) push(a.href); });
   // 过滤干扰项：图片/静态资源，以及不属于本文 PII 的 pdfft（参考文献错链）
-  const pagePii = (probe.url.match(/\/pii\/([A-Za-z0-9]+)/) || [])[1] || '';
-  const filtered = candidates.filter((u) => {
-    if (/\.(?:jpe?g|png|gif|svg|css|js)(?:\?|$)/i.test(u)) return false;
-    if (/\/pdfft(?:\?|$)/i.test(u) && pagePii && !u.toUpperCase().includes(pagePii.toUpperCase())) return false;
-    return true;
-  });
+  const filtered = candidates.filter(u => candidateAllowed(u,probe.url,args.url));
   filtered.sort((a, b) =>
     Number(/(\/pdfft|\/pdf\/|\.pdf(?:\?|$))/i.test(b)) - Number(/(\/pdfft|\/pdf\/|\.pdf(?:\?|$))/i.test(a)));
   candidates.length = 0; candidates.push(...filtered);
@@ -603,7 +601,7 @@ function httpDownload(target, headers, redirects = 6) {
       try { sameOrigin = new URL(url).origin === pageOrigin; } catch { /* ignore */ }
       if (!sameOrigin) { log('跳过跨域候选（改走点击）:', url.slice(0, 120)); continue; }
       const res = await fetchPdfInPage(cdp, sessionId, url);
-      if (res && res.b64 && res.b64.length > 1000) {
+      if (res && !/^(image\/|text\/html)/i.test(res.ctype||'') && res.b64 && res.b64.length > 1000) {
         saved = writePdfFromBase64(res.b64, nameHint);
         if (saved) { log('页面内 fetch 成功:', saved.path); break; }
       } else {
@@ -618,9 +616,11 @@ function httpDownload(target, headers, redirects = 6) {
     netUrls.length = 0;
     const before = fs.readdirSync(outDir).filter((f) => f.toLowerCase().endsWith('.pdf'))
       .map((f) => path.join(outDir, f));
+    if(requiresUser(await evaluate(cdp,sessionId,DOM_PROBE)))throw new Error('authentication_required');
     clicked = await evaluate(cdp, sessionId, `(() => {
       const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-      const all = Array.from(document.querySelectorAll('a,button,div,span,li'));
+      const allowed=${candidateAllowed.toString()};
+      const all = Array.from(document.querySelectorAll('a,button,div,span,li')).filter(el=>{if(el.closest('section.references,section#references,[class*=\"reference-list\"]'))return false;const href=el.href||(el.closest('a')||{}).href;return !href||allowed(href,location.href,${JSON.stringify(args.url)});});
       const leaf = (el) => !Array.from(el.children).some((ch) => /下载|PDF|全文/i.test(norm(ch.textContent)));
       const inResult = (el) => Boolean(el.closest('[class*="item"],[class*="result"],[class*="list"],[class*="row"]'));
       const pickers = [
@@ -656,9 +656,9 @@ function httpDownload(target, headers, redirects = 6) {
       await sleep(3000);
       log('网络层候选:', netUrls.slice(0, 6));
       for (const u of netUrls.slice(0, 6)) {
-        if (!/^https?:/i.test(u) || /\.js(\?|$)/i.test(u)) continue;
+        if (!candidateAllowed(u,probe.url,args.url)) continue;
         const res = await fetchPdfInPage(cdp, sessionId, u);
-        if (res && res.b64 && res.b64.length > 1000) {
+        if (res && !/^(image\/|text\/html)/i.test(res.ctype||'') && res.b64 && res.b64.length > 1000) {
           saved = writePdfFromBase64(res.b64, nameHint);
           if (saved) { log('网络请求回放成功:', saved.path); break; }
         }
@@ -673,7 +673,8 @@ function httpDownload(target, headers, redirects = 6) {
       if (!/^https?:/i.test(u)) continue;
       let hostname = '';
       try { hostname = new URL(u).hostname; } catch { continue; }
-      if (!u.startsWith('https:')) continue;
+      if (!u.startsWith('https:')||!candidateAllowed(u,probe.url,args.url)) continue;
+      if(requiresUser(await evaluate(cdp,sessionId,DOM_PROBE)))throw new Error('authentication_required');
       const allCookies = await cdp.send('Network.getCookies', {urls:[u]}, sessionId).then(r => r.cookies || []).catch(() => []);
       const res = await httpDownload(u, {
         'User-Agent': ua,
@@ -683,7 +684,7 @@ function httpDownload(target, headers, redirects = 6) {
         'Cookie': cookieHeaderFor(allCookies, hostname),
       });
       const body = res.body;
-      if (body && body.length > 1024 && body.slice(0, 5).toString() === '%PDF-' && body.subarray(-4096).includes(Buffer.from('%%EOF'))) {
+      if (!/^(image\/|text\/html)/i.test((res.headers||{})['content-type']||'') && body && body.length > 1024 && body.slice(0, 5).toString() === '%PDF-' && body.subarray(-4096).includes(Buffer.from('%%EOF'))) {
         saved = writePdfFromBase64(body.toString('base64'), nameHint);
         if (saved) { log('Cookie+Referer 下载成功:', saved.path); break; }
       } else {
@@ -716,9 +717,9 @@ function httpDownload(target, headers, redirects = 6) {
     const urls = [];
     if (/\.pdf(\?|$)/i.test(inner.url)) urls.push(inner.url);
     (inner.embeds || []).forEach((u) => urls.push(u));
-    for (const u of urls) {
+    for (const u of urls.filter(u=>candidateAllowed(u,probe.url,args.url))) {
       const res = await fetchPdfInPage(cdp, sessionId, u);
-      if (res && res.b64) {
+      if (res && !/^(image\/|text\/html)/i.test(res.ctype||'') && res.b64) {
         saved = writePdfFromBase64(res.b64, nameHint);
         if (saved) { log('内嵌 PDF 抓取成功:', saved.path); break; }
       }
@@ -734,6 +735,14 @@ function httpDownload(target, headers, redirects = 6) {
     if (saved) log('直接导航下载成功:', saved.path);
   }
 
+  let validationResult=null;
+  if(saved){
+    validationResult=verifySaved(saved,args.doi,args.title);
+    if(['invalid_pdf','identity_mismatch'].includes(validationResult.status)){
+      console.log(JSON.stringify(sanitize({...validationResult,note:'文件已隔离，未登记为成功；请人工核对目标论文。'})));
+      cdp.close();process.exit(1);
+    }
+  }
   // 写入 manifest.jsonl（paper_oa.py organize 可直接归档）
   if (saved) {
     try {
@@ -746,10 +755,11 @@ function httpDownload(target, headers, redirects = 6) {
         year: null,
         venue: '',
         identifier: args.doi || publicUrl(probe.url),
-        status: 'saved_pending_verification',
+        status: validationResult.status,
+        verification: validationResult.verification,
         source: 'browser',
         license: null,
-        version: null,
+        version: 'unknown',
         url: publicUrl(probe.url),
         path: saved.path,
         bytes: saved.bytes,
@@ -765,7 +775,7 @@ function httpDownload(target, headers, redirects = 6) {
   }
 
   const payload = {
-    status: saved ? 'saved_pending_verification' : (needUser ? 'need_user' : 'no_pdf_found'),
+    status: saved ? validationResult.status : (needUser ? 'need_user' : 'no_pdf_found'),
     url: probe.url,
     title: args.title || probe.title,
     saved: saved ? saved.path : null,
@@ -773,12 +783,12 @@ function httpDownload(target, headers, redirects = 6) {
     doi: args.doi || null,
     candidates,
     need_user: needUser,
-    note: saved ? (saved.record ? '已保存并登记；请用 pdf_check.py 核验完整性和题名，未核验不算下载完成' : '已保存但清单写入失败，请先补登记并核验')
+    note: saved && validationResult.status==='downloaded' ? '本地结构与篇目自动核验通过并登记；稿件版本与访问许可仍需确认' : saved ? (saved.record ? '已保存并登记；请用 pdf_check.py 核验完整性和题名，未核验不算下载完成' : '已保存但清单写入失败，请先补登记并核验')
       : '未拿到 PDF：可能未订阅该刊、页面需要登录/验证，或下载按钮在 iframe 内；可重跑 --wait-user',
   };
   console.log(JSON.stringify(sanitize(payload)));
   cdp.close();
-  process.exit(saved ? (saved.record ? 3 : 1) : (needUser ? 4 : 3));
+  process.exit(saved ? (saved.record ? (validationResult.status==='downloaded'?0:3) : 1) : (needUser ? 4 : 3));
 }
-if (require.main === module) main().catch(e => { console.log(JSON.stringify(sanitize({status:'error', message:e.message || String(e)}))); process.exit(1); });
+if (require.main === module) main().catch(e => {const human=e.message==='authentication_required';console.log(JSON.stringify(sanitize({status:human?'need_user':'error',message:e.message||String(e)})));process.exit(human?4:1);});
 module.exports = {parseArgs};

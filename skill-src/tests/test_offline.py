@@ -234,4 +234,29 @@ class Offline(unittest.TestCase):
             with self.subTest(base=base), self.assertRaises(ValueError): vpn.to_webvpn('https://example.org',base)
         with self.assertRaises(ValueError): vpn.to_webvpn('https://user:pass@example.org')
 
+
+    def test_import_name_version_and_json_line(self):
+        source=self.root/'source';source.mkdir();pdf=source/'original.pdf';pdf.write_bytes(pdf_fixture())
+        out=self.root/'imported'
+        args=oa.build_parser().parse_args(['import-file',str(pdf),'--doi',DOI,'--title',TITLE,'--out',str(out),'--name','selected.pdf','--version','preprint'])
+        stdout=io.StringIO()
+        with contextlib.redirect_stdout(stdout):self.assertEqual(oa.cmd_import_file(args,self.cfg),0)
+        self.assertEqual(len(stdout.getvalue().splitlines()),1)
+        result=json.loads(stdout.getvalue());self.assertEqual(result['version'],'preprint');self.assertEqual(Path(result['path']).name,'selected.pdf');self.assertTrue(pdf.exists())
+        args.name='../escape.pdf'
+        with self.assertRaises(ValueError):oa.cmd_import_file(args,self.cfg)
+
+    def test_batch_resume_revalidates_files(self):
+        path,manifest,record=self.seed();record['status']='downloaded'
+        listing=self.root/'dois.txt';listing.write_text(DOI+'\n')
+        args=argparse.Namespace(file=str(listing),out=str(self.root),force=False,resume=False,state=None)
+        with patch.object(oa,'fetch_one',return_value=record),contextlib.redirect_stdout(io.StringIO()):self.assertEqual(oa.cmd_batch(args,self.cfg),0)
+        journal=self.root/'batch-state.jsonl';self.assertEqual(json.loads(journal.read_text().splitlines()[0])['identifier'],DOI)
+        args.resume=True
+        with patch.object(oa,'fetch_one') as fetch,contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(oa.cmd_batch(args,self.cfg),0);fetch.assert_not_called()
+        path.write_bytes(b'corrupted')
+        with patch.object(oa,'fetch_one',return_value={'status':'download_failed'}) as fetch,contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(oa.cmd_batch(args,self.cfg),1);fetch.assert_called_once()
+
 if __name__=='__main__': unittest.main(verbosity=2)

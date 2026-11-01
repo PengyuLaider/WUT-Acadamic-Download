@@ -48,3 +48,28 @@ test('CDP timeout rejects',async()=>{
 test('CDP disconnect rejects all requests',async()=>{
   const ws=new FakeSocket(),cdp=new Cdp(ws,500);const p=cdp.send('Page.enable');ws.close();await assert.rejects(p,/disconnected/);assert.equal(cdp.pending.size,0);
 });
+
+const {candidateAllowed}=require('../scripts/browser_support');
+const {verifySaved}=require('../scripts/browser_verification');
+test('reference PDFs and image assets cannot become article candidates',()=>{
+  const page='https://www.sciencedirect.com/science/article/pii/S123456789';
+  assert.equal(candidateAllowed(page+'/pdfft?md5=secret',page),true);
+  for(const u of ['https://e.org/science/article/pii/S999999999/pdfft?md5=x','https://e.org/pdfft?md5=x','https://ars.els-cdn.com/content/image/a.jpg','https://e.org/a.pdf.jpg#x','javascript:alert(1)'])assert.equal(candidateAllowed(u,page),false,u);
+  assert.equal(candidateAllowed('https://ieeexplore.ieee.org/stampPDF/getPDF.jsp?arnumber=2','https://ieeexplore.ieee.org/document/1','https://ieeexplore.ieee.org/stamp?arnumber=1'),false);
+});
+test('expired school portal titles stop article processing without visible password fields',()=>{
+  for(const title of ['资源访问控制系统','统一身份认证','用户登录'])assert.equal(requiresUser({title,url:'https://webvpn.whut.edu.cn/'}),true);
+  assert.equal(requiresUser({title:'Research on institutional authentication',bodyText:'Access through your institution'}),false);
+});
+test('post-download verifier quarantines identity mismatch and preserves evidence',()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'campus-verify-'));const file=path.join(dir,'article.pdf');fs.writeFileSync(file,'wrong document');
+  try{
+    const result=verifySaved({path:file},'10.1234/test','Target title',()=>({stdout:JSON.stringify({valid:true,text_available:true,title_checkable:true,title_match:false,identity:'unverified'})}));
+    assert.equal(result.status,'identity_mismatch');assert.equal(fs.existsSync(file),false);assert.equal(fs.readFileSync(result.path,'utf8'),'wrong document');
+  }finally{fs.rmSync(dir,{recursive:true});}
+});
+test('missing parser and single-page preview never become verified downloads',()=>{
+  assert.equal(verifySaved({path:'unused'},'','title',()=>({error:new Error('not installed')})).status,'saved_pending_verification');
+  assert.equal(verifySaved({path:'unused'},'','title',()=>({stdout:JSON.stringify({valid:true,identity:'matched',review_required:['single_page_confirm_full_text']})})).status,'saved_pending_verification');
+  assert.equal(verifySaved({path:'unused'},'','title',()=>({stdout:JSON.stringify({valid:true,identity:'matched'})})).status,'downloaded');
+});

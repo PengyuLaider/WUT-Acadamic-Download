@@ -23,6 +23,7 @@ function sanitize(value) {
 function requiresUser(p) {
   if (!p) return true;
   return Boolean(p.captchaEl || p.passwordEl ||
+    /资源访问控制系统|统一身份认证|智慧理工大.*登录|用户登录|single sign.on|sign in to your account/i.test(p.title || "") ||
     /\/(?:login|signin)(?:[/?#]|$)|verify\/home|captchaType=|captchaId=|cdn-cgi\/challenge/i.test(p.url || '') ||
     /请完成安全验证|向右滑动完成验证|拖动滑块|滑块验证|are you a robot|confirm you are a human|captcha challenge|请验证您是真人|verify (?:that )?you are human|checking your browser|just a moment|请稍候…?$/i.test(p.bodyText || '') ||
     /are you a robot|just a moment|请稍候…?$/i.test(p.title || ''));
@@ -40,6 +41,23 @@ function basicPdf(path, maxBytes = 60 * 1024 * 1024) {
       return head.toString() === '%PDF-' && tail.includes(Buffer.from('%%EOF'));
     } finally { fs.closeSync(fd); }
   } catch { return false; }
+}
+
+
+function candidateAllowed(value,pageUrl,targetUrl='') {
+  try {
+    const u=new URL(value,pageUrl);
+    if(!/^https?:$/.test(u.protocol)||u.username||u.password)return false;
+    if(/\.(?:jpe?g|png|gif|svg|webp|css|js)(?:$|[?#])/i.test(u.href)||/ars\.els-cdn\.com/i.test(u.hostname))return false;
+    const pii=v=>{const x=new URL(v,pageUrl);return ((decodeURIComponent(x.pathname).match(/(?:\/pii\/|1-s2\.0-)([a-z0-9]+)/i)||[])[1]||x.searchParams.get('pii')||'').toUpperCase();};
+    const expected=pii(targetUrl||pageUrl)||pii(pageUrl), actual=pii(u.href);
+    if(expected && actual && expected!==actual)return false;
+    if(/\/pdfft(?:[?#]|$)/i.test(u.href)&&(!expected||actual!==expected))return false;
+    const original=new URL(targetUrl||pageUrl,pageUrl);
+    const wanted=original.searchParams.get('arnumber'), got=u.searchParams.get('arnumber');
+    if(wanted&&got&&wanted!==got)return false;
+    return true;
+  } catch {return false;}
 }
 
 class Cdp {
@@ -73,4 +91,4 @@ class Cdp {
   close() { try { this.ws.close(); } catch {} }
 }
 
-module.exports = {publicUrl, sanitize, requiresUser, basicPdf, Cdp};
+module.exports = {publicUrl, sanitize, requiresUser, basicPdf, candidateAllowed, Cdp};

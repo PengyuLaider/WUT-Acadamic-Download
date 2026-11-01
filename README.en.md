@@ -208,10 +208,12 @@ The project owner still needs to select a license before advertising an open-sou
 
 ## Validation snapshot
 
-50 Python and 30 Node offline tests pass locally. Language switching, English validation and simulated saving were checked in the local browser. Institutional authentication and live full-text downloads still need validation in the user environment.
+52 Python and 35 Node offline tests pass locally. Language switching, English validation and simulated saving were checked in the local browser. Institutional authentication and live full-text downloads still need validation in the user environment.
 
 ## Feedback
 
 Use [Issues](https://github.com/PengyuLaider/WUT-Acadamic-Download/issues) with your OS, Python / Node versions, reproduction steps and redacted errors. Do not attach real credential files, cookies, browser profiles or subscribed full-text papers.
 
 Main documentation can be newer than a release ZIP. Existing releases remain fixed snapshots. This independent project is not an official university service.
+
+Report-driven repair candidate and on-campus acceptance tasks: [handoff](skill-src/references/usage-report-handoff.md). This branch has offline evidence only; it does not claim to reproduce the reported 50-paper live task.
