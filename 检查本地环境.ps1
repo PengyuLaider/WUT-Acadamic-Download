@@ -2,9 +2,8 @@
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 $env:PYTHONUTF8 = '1'
-$bundled = Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies'
 $pythonExe = $null
-foreach ($candidate in @($env:DSH_PYTHON, (Join-Path $bundled 'python\python.exe'), 'python')) {
+foreach ($candidate in @($env:CAMPUS_PYTHON, $env:DSH_PYTHON, 'python')) {
     if (-not $candidate) { continue }
     $command = Get-Command $candidate -ErrorAction SilentlyContinue
     if (-not $command) { continue }
@@ -13,7 +12,7 @@ foreach ($candidate in @($env:DSH_PYTHON, (Join-Path $bundled 'python\python.exe
 }
 if (-not $pythonExe) { throw '需要 Python 3.10+；可设置 DSH_PYTHON 为解释器绝对路径。' }
 $nodeExe = $null
-foreach ($candidate in @($env:CAMPUS_NODE, (Join-Path $bundled 'node\bin\node.exe'), 'node')) {
+foreach ($candidate in @($env:CAMPUS_NODE, 'node')) {
     if (-not $candidate) { continue }
     $command = Get-Command $candidate -ErrorAction SilentlyContinue
     if (-not $command) { continue }
@@ -33,7 +32,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Python 回归失败' }
 if ($LASTEXITCODE -ne 0) { throw 'Node 回归失败' }
 & $nodeExe --test (Join-Path $skillPath 'tests\test_login.js')
 if ($LASTEXITCODE -ne 0) { throw '登录配置回归失败' }
-& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $skillPath 'tests\test_network.ps1')
+& powershell -NoProfile -File (Join-Path $skillPath 'tests\test_network.ps1')
 if ($LASTEXITCODE -ne 0) { throw 'PowerShell 回归失败' }
 & $pythonExe (Join-Path $skillPath 'scripts\webvpn_url.py') --selftest
 if ($LASTEXITCODE -ne 0) { throw 'WebVPN URL 样本自检失败' }

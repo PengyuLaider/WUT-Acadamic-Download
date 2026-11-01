@@ -266,3 +266,7 @@ export_public.py             公开发布包导出
 问题反馈请附系统、Python / Node 版本、执行步骤与脱敏错误信息，通过 [Issues](https://github.com/PengyuLaider/WUT-Acadamic-Download/issues) 提交。不要附真实账号文件、Cookie、浏览器 profile 或订阅论文。
 
 本项目为独立工具，非学校官方服务。当前仓库尚未声明开源许可证；公开可见不等于已经授予任意使用许可。数据处理见 [SECURITY.md](SECURITY.md)。
+
+## 使用报告后的修复候选
+
+2026-11-01：候选过滤、下载后核验与隔离、批次进度与续跑、单行导入 JSON、文件命名与稿件版本、独立安装凭据路径与运行时选择已做离线修复。当前 52 项 Python、35 项 Node 回归通过；现场待办与逐项结论见 [使用报告接续](skill-src/references/usage-report-handoff.md)。本分支尚未完成真实学校登录及出版社下载验收。

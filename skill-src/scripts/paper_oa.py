@@ -1094,12 +1094,24 @@ def cmd_batch(args, cfg: dict) -> int:
     ]
     out_dir = Path(args.out or cfg.get("download_dir") or "papers").expanduser()
     results = []
+    out_dir.mkdir(parents=True, exist_ok=True)
+    progress = Path(getattr(args,'state',None) or out_dir/'batch-state.jsonl')
+    progress.parent.mkdir(parents=True,exist_ok=True)
+    prior={r.get('identifier'):r for r in read_manifest(progress)} if getattr(args,'resume',False) else {}
     for index, identifier in enumerate(identifiers, start=1):
         try:
-            result = fetch_one(identifier, cfg, out_dir, force=args.force)
+            previous=prior.get(public_url(identifier))
+            if previous and previous.get('status') in ('downloaded','exists') and not args.force and record_file_valid(previous,progress):
+                result={**previous,'status':'exists','resumed':True}
+            else:
+                result = fetch_one(identifier, cfg, out_dir, force=args.force)
         except (OSError, ValueError, RuntimeError) as exc:
             result = {"status": "error", "identifier": public_url(identifier), "reason": type(exc).__name__}
         results.append(result)
+        checkpoint={key:result.get(key) for key in ('status','path','sha256','doi','title','reason')}
+        checkpoint['identifier']=public_url(identifier)
+        with progress.open('a',encoding='utf-8') as handle:
+            handle.write(json.dumps(checkpoint,ensure_ascii=False)+'\n');handle.flush();os.fsync(handle.fileno())
         print(f"[{index}/{len(identifiers)}] {result.get('status')}  {identifier}", file=sys.stderr)
         if index < len(identifiers):
             polite_sleep(cfg)
@@ -1130,9 +1142,12 @@ def cmd_import_file(args, cfg: dict) -> int:
     manifest = out / "manifest.jsonl"
     existing = next((r for r in reversed(read_manifest(manifest))
                      if r.get("sha256") == validation["sha256"] and record_file_valid(r, manifest)), None)
-    destination = record_path(existing, manifest) if existing else source
-    if destination.parent != out:
-        name = build_pdf_name({"title": args.title or source.stem}, args.doi or source.stem)
+    requested=getattr(args,'name',None)
+    if requested and (not requested.lower().endswith('.pdf') or requested in ('.pdf','..pdf') or len(requested)>160 or re.search(r'[\\/:*?"<>|\x00-\x1f]',requested) or re.match(r'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)',requested,re.I)):
+        raise ValueError('name must be a safe PDF basename')
+    destination = record_path(existing, manifest) if existing and not requested else source
+    if destination.parent != out or (requested and destination.name!=requested):
+        name = requested or source.name
         destination = out / name
         count = 2
         while destination.exists():
@@ -1145,10 +1160,10 @@ def cmd_import_file(args, cfg: dict) -> int:
               "doi": normalize_doi(args.doi or ""), "title": args.title or "", "authors": [],
               "year": None, "source": "local-import", "url": public_url(args.source_url or ""),
               "path": str(destination), "sha256": validation["sha256"], "bytes": validation["bytes"],
-              "verification": validation, "retrieved_at": now_iso(), "license": None, "version": None}
+              "verification": validation, "retrieved_at": now_iso(), "license": None, "version": getattr(args,"version","unknown")}
     with manifest.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-    print(json.dumps(record, ensure_ascii=False, indent=2))
+    print(json.dumps(record, ensure_ascii=False))
     return 0 if status == "downloaded" else 3
 
 
@@ -1163,7 +1178,7 @@ def cmd_organize(args, cfg: dict) -> int:
         return 2
     index_path = target / "index.csv"
     fields = ["status", "doi", "year", "authors", "title", "venue", "source", "license",
-              "bytes", "path", "retrieved_at", "sha256"]
+              "bytes", "path", "retrieved_at", "sha256", "version"]
     missing = []
     with index_path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
@@ -1214,6 +1229,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_batch.add_argument("file")
     p_batch.add_argument("--out")
     p_batch.add_argument("--force", action="store_true")
+    p_batch.add_argument('--resume',action='store_true',help='仅复用进度文件中仍通过哈希和篇目核验的成功项')
+    p_batch.add_argument('--state',help='JSONL 进度文件，默认输出目录/batch-state.jsonl')
     p_batch.set_defaults(func=cmd_batch)
 
     p_organize = sub.add_parser("organize", help="由 manifest.jsonl 生成 index.csv")
@@ -1226,6 +1243,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_import.add_argument("--title", required=True, help="已确认的目标论文题名")
     p_import.add_argument("--source-url", default="")
     p_import.add_argument("--out")
+    p_import.add_argument('--name',help='可选 PDF 文件名，不接受路径；默认保留原文件名')
+    p_import.add_argument('--version',choices=['unknown','preprint','accepted','published'],default='unknown')
     p_import.set_defaults(func=cmd_import_file)
     return parser
 

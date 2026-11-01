@@ -96,3 +96,14 @@ test('login arguments are separate from paper downloads',()=>{
   const parse=(...a)=>parseArgs(['node','script',...a]);assert.equal(parse('--login').login,true);assert.equal(parse('--login','--credentials','private.json').credentials,'private.json');
   assert.throws(()=>parse('--login','--url','https://example.org'));assert.throws(()=>parse('--login','--credentials'));
 });
+
+test('standalone skill does not guess a credentials file in its parent',()=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'standalone-skill-'));
+  try{
+    const scripts=path.join(root,'scripts');fs.mkdirSync(scripts);const target=path.join(scripts,'login_credentials.js');
+    fs.copyFileSync(path.join(__dirname,'../scripts/login_credentials.js'),target);
+    const env={...process.env};delete env.CAMPUS_CREDENTIALS;
+    const result=spawnSync(process.execPath,[target,'--check'],{encoding:'utf8',env});
+    assert.equal(result.status,2);assert.equal(JSON.parse(result.stdout).reason,'credential_path_required_use_explicit_config');
+  }finally{fs.rmSync(root,{recursive:true});}
+});
