@@ -13,17 +13,24 @@
 
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File campus_net.ps1 -Action status -Json
+  powershell -NoProfile -ExecutionPolicy Bypass -File campus_net.ps1 -Action status -Json -UseSystemProxy
   powershell -NoProfile -ExecutionPolicy Bypass -File campus_net.ps1 -Action vpn-url -Url "https://kns.cnki.net/" -Json
   powershell -NoProfile -ExecutionPolicy Bypass -File campus_net.ps1 -Action open -Url "https://doi.org/10.1038/nature12373" -Vpn
+
+.NOTES
+  status 的校园网/公网 IP 探测默认直连（HttpWebRequest.Proxy=$null），绕过 Clash 等
+  Windows 系统代理；需要走系统代理时显式加 -UseSystemProxy。
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('status', 'login', 'vpn-url', 'open', 'save-cred')]
+    [ValidateSet('status', 'login', 'vpn-url', 'open', 'carsi', 'save-cred')]
     [string]$Action = 'status',
 
     [string]$Config = '',
     [string]$Url = '',
     [switch]$Vpn,
+    # status 探测默认绕过 Clash/系统代理；加此开关恢复走系统代理（会把出口判成代理节点）
+    [switch]$UseSystemProxy,
     [switch]$Json
 )
 
@@ -41,6 +48,10 @@ try {
     [Console]::OutputEncoding = [Text.Encoding]::UTF8
     $OutputEncoding = [Text.Encoding]::UTF8
 } catch { }
+
+# status 探测的代理偏好：-UseSystemProxy 显式指定时优先；否则由 config 的 proxy_mode 决定
+# （默认 direct，直连探测，避免 Clash 等系统代理把出口 IP 变成东京节点导致校园网误判）。
+$script:UseSystemProxyPreference = if ($PSBoundParameters.ContainsKey('UseSystemProxy')) { [bool]$UseSystemProxy } else { $null }
 
 $ScriptDir = Split-Path -Parent $PSCommandPath
 $SkillDir = Split-Path -Parent $ScriptDir
@@ -92,7 +103,19 @@ $DefaultSettings = [ordered]@{
         portal = 'http://carsi.whut.edu.cn/'
         idp_entity_id = 'https://idp.whut.edu.cn/idp/shibboleth'
     }
-    campus_cidrs = @()
+    # 内置 WHUT/CERNET 网段（与 Get-BuiltinCampusCidrs 一致）；campus_cidrs 支持 config 覆盖/追加
+    campus_cidrs = @('202.114.48.0/20', '202.114.88.0/21', '218.197.96.0/19')
+    campus_cidrs_mode = 'append'            # append = 内置网段 + 本列表；replace = 只用本列表
+    campus_private_cidrs = @('10.82.0.0/16', '10.83.0.0/16')  # 校园 LAN 私网（弱证据）
+    campus_private_cidrs_mode = 'append'    # 同上；私网网段只作弱证据
+    proxy_mode = 'direct'                   # direct = status 探测直连；system = 走系统代理；-UseSystemProxy 优先
+    cernet = [ordered]@{
+        lookup_enabled = $true
+        timeout_seconds = 8                 # 单次查询超时上限 8s；失败只记录证据，不影响判定
+        lookup_urls = @('https://ipinfo.io/{ip}/json', 'https://api.bgpview.io/ip/{ip}')
+        expected_asns = @(4538)             # CERNET AS4538
+        org_markers = @('CERNET', 'China Education and Research Network', '教育网', '中国教育和科研计算机网')
+    }
 }
 
 function Write-Diag([string]$Message) {
@@ -142,6 +165,84 @@ if ($configPath) {
 }
 $settings._config_path = $configPath
 
+# ---------------------------------------------------------------- 通用取值 / 校园网判定辅助
+function Get-SettingValue([string]$Name, $Default = $null) {
+    try {
+        if ($null -ne $settings -and $settings -is [System.Collections.IDictionary] -and $settings.Contains($Name)) {
+            return $settings[$Name]
+        }
+        if ($null -ne $settings) {
+            $prop = $settings.PSObject.Properties[$Name]
+            if ($prop) { return $prop.Value }
+        }
+    } catch { }
+    return $Default
+}
+
+function Get-SectionSetting([string]$Section, [string]$Name, $Default = $null) {
+    $sec = Get-SettingValue $Section $null
+    if ($null -eq $sec) { return $Default }
+    try {
+        if ($sec -is [System.Collections.IDictionary] -and $sec.Contains($Name)) { return $sec[$Name] }
+        $prop = $sec.PSObject.Properties[$Name]
+        if ($prop) { return $prop.Value }
+    } catch { }
+    return $Default
+}
+
+function Get-BuiltinCampusCidrs {
+    # WHUT/CERNET 内置网段：覆盖 202.114.56.2、202.114.89.79、202.114.49.228、
+    # 218.197.100.87、218.197.104.131、218.197.111.6 等已知学校地址。
+    return @('202.114.48.0/20', '202.114.88.0/21', '218.197.96.0/19')
+}
+
+function Get-BuiltinCampusPrivateCidrs {
+    # 校园 LAN 私网：本机网关 10.83.255.254，图书馆看到的 rqIp 常见 10.82.x。
+    # 私网可能与外单位重叠，仅作弱证据（on_campus_reason=campus_lan_private / library_rqip）。
+    return @('10.82.0.0/16', '10.83.0.0/16')
+}
+
+function Merge-CampusCidrList($Builtin, $User, [string]$Mode) {
+    $builtinList = @()
+    foreach ($c in @($Builtin)) {
+        if ($c -and ($builtinList -notcontains [string]$c)) { $builtinList += [string]$c }
+    }
+    $userList = @()
+    foreach ($c in @($User)) {
+        if ($c -and ($userList -notcontains [string]$c)) { $userList += [string]$c }
+    }
+    if ($Mode -eq 'replace') {
+        if ($userList.Count -gt 0) { return $userList }
+        return @()
+    }
+    $merged = @($builtinList)
+    foreach ($c in $userList) {
+        if ($merged -notcontains $c) { $merged += $c }
+    }
+    return $merged
+}
+
+function Get-CampusCidrSet {
+    $mode = [string](Get-SettingValue 'campus_cidrs_mode' 'append')
+    $user = Get-SettingValue 'campus_cidrs' @()
+    return @(Merge-CampusCidrList (Get-BuiltinCampusCidrs) $user $mode)
+}
+
+function Get-CampusPrivateCidrSet {
+    $mode = [string](Get-SettingValue 'campus_private_cidrs_mode' 'append')
+    $user = Get-SettingValue 'campus_private_cidrs' @()
+    return @(Merge-CampusCidrList (Get-BuiltinCampusPrivateCidrs) $user $mode)
+}
+
+function Get-UseSystemProxy {
+    # 优先级：-UseSystemProxy / 脚本变量 > config.proxy_mode > 默认直连
+    try {
+        $existing = Get-Variable -Name UseSystemProxyPreference -Scope Script -ErrorAction SilentlyContinue
+        if ($existing -and $null -ne $existing.Value) { return [bool]$existing.Value }
+    } catch { }
+    return ([string](Get-SettingValue 'proxy_mode' 'direct') -eq 'system')
+}
+
 function Write-Result($Object, [string]$HumanText) {
     if ($Json) {
         $Object | ConvertTo-Json -Depth 10
@@ -158,46 +259,134 @@ function Get-FinalUrl($Response, [string]$Fallback) {
     return $Fallback
 }
 
-function Test-Url([string]$Target, [int]$TimeoutSec = 20) {
-    $result = [ordered]@{
-        url = $Target; ok = $false; status = $null; final_url = $null
-        redirected = $false; error = $null; body_head = ''; body_full = ''; elapsed_ms = $null
-    }
-    $watch = [Diagnostics.Stopwatch]::StartNew()
+function Read-HttpResponseText($Response, [int]$MaxChars = 1048576) {
+    $text = ''
+    if ($null -eq $Response) { return $text }
+    $stream = $null
+    $reader = $null
     try {
-        $response = Invoke-WebRequest -Uri $Target -UseBasicParsing -TimeoutSec $TimeoutSec `
-            -MaximumRedirection 8 -UserAgent 'Mozilla/5.0 campus-library-papers status probe'
-        $result.ok = $true
-        $result.status = [int]$response.StatusCode
-        $result.final_url = Get-FinalUrl $response $Target
-        $content = ''
-        if ($response.Content -is [byte[]]) {
-            $content = [Text.Encoding]::UTF8.GetString($response.Content)
-        } elseif ($response.Content) {
-            $content = [string]$response.Content
+        $stream = $Response.GetResponseStream()
+        if ($null -eq $stream) { return $text }
+        $encoding = [Text.Encoding]::UTF8
+        try {
+            $charset = [string]$Response.CharacterSet
+            if ($charset) { $encoding = [Text.Encoding]::GetEncoding($charset) }
+        } catch { $encoding = [Text.Encoding]::UTF8 }
+        $reader = New-Object System.IO.StreamReader($stream, $encoding)
+        $text = $reader.ReadToEnd()
+        if ($text.Length -gt $MaxChars) { $text = $text.Substring(0, $MaxChars) }
+    } catch {
+    } finally {
+        if ($reader) { try { $reader.Dispose() } catch { } }
+        if ($stream) { try { $stream.Dispose() } catch { } }
+    }
+    return $text
+}
+
+function New-HttpProbeResult([string]$Uri) {
+    return [ordered]@{
+        url = $Uri; ok = $false; status = $null; final_url = $null; redirected = $false
+        body = ''; error = $null; used_system_proxy = $false; elapsed_ms = $null
+    }
+}
+
+function Invoke-DirectHttpRequest {
+    <#
+      status 探测用 GET。
+      默认 Proxy=$null 直连，绕过 Clash / WinINET 系统代理（否则出口 IP 会变成代理节点，
+      校园网判定永远失败）；-UseProxy 显式恢复系统代理。
+      不抛异常：失败时 ok=$false、error 有文本，调用方据此优雅降级。
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Uri,
+        [int]$TimeoutSec = 12,
+        [switch]$UseProxy,
+        [int]$MaxRedirections = 8,
+        [string]$UserAgent = 'Mozilla/5.0 campus-library-papers status probe'
+    )
+    $result = New-HttpProbeResult $Uri
+    if ([string]::IsNullOrWhiteSpace($Uri)) { $result.error = 'empty uri'; return $result }
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $request = $null
+    $response = $null
+    try {
+        $request = [System.Net.HttpWebRequest]::Create($Uri)
+        $request.Method = 'GET'
+        $request.UserAgent = $UserAgent
+        $request.AllowAutoRedirect = $true
+        $request.MaximumAutomaticRedirections = [Math]::Max(0, $MaxRedirections)
+        $timeoutMs = [int][Math]::Max(1000, $TimeoutSec * 1000)
+        $request.Timeout = $timeoutMs
+        $request.ReadWriteTimeout = $timeoutMs
+        try {
+            $request.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+        } catch { }
+        if ($UseProxy) {
+            # 显式恢复系统代理（IE/WinINET 设置，Clash 等通常改这里）
+            try {
+                $proxy = [System.Net.WebRequest]::GetSystemWebProxy()
+                if ($proxy) {
+                    try { $proxy.Credentials = [System.Net.CredentialCache]::DefaultCredentials } catch { }
+                    $request.Proxy = $proxy
+                } else {
+                    $request.Proxy = [System.Net.WebRequest]::DefaultWebProxy
+                }
+            } catch { }
+            $result.used_system_proxy = $true
+        } else {
+            # Proxy=$null 即直连：不读取 IE/Clash 系统代理设置
+            $request.Proxy = $null
         }
-        $result.body_head = $content.Substring(0, [Math]::Min(1200, $content.Length))
-        # body_full 供登录流程解析隐藏字段/验证码；限制 512 KB 防止异常大页面
-        $result.body_full = $content.Substring(0, [Math]::Min(524288, $content.Length))
+        $response = $request.GetResponse()
+        $result.status = [int]$response.StatusCode
+        try { $result.final_url = $response.ResponseUri.AbsoluteUri } catch { }
+        $result.body = Read-HttpResponseText $response
+        $result.ok = ($result.status -ge 200 -and $result.status -lt 400)
     } catch [System.Net.WebException] {
-        $response = $_.Exception.Response
-        if ($response -and $response.StatusCode) { $result.status = [int]$response.StatusCode }
+        $webResponse = $_.Exception.Response
+        if ($webResponse) {
+            $response = $webResponse
+            try { $result.status = [int]$webResponse.StatusCode } catch { }
+            try { $result.final_url = $webResponse.ResponseUri.AbsoluteUri } catch { }
+            $result.body = Read-HttpResponseText $webResponse
+        }
         $result.error = $_.Exception.Message
     } catch {
         $result.error = $_.Exception.Message
-        # PowerShell 7 的 HttpResponseException 不是 WebException，这里兜底取状态码
+    } finally {
+        if ($response) { try { $response.Close() } catch { } }
+        $watch.Stop()
+        $result.elapsed_ms = [int]$watch.ElapsedMilliseconds
+    }
+    if ($result.final_url) {
         try {
-            $statusCode = $_.Exception.Response.StatusCode
-            if ($statusCode) { $result.status = [int]$statusCode }
+            $a = [Uri]$Uri
+            $b = [Uri]$result.final_url
+            $result.redirected = ($a.Scheme -ne $b.Scheme) -or ($a.Host -ne $b.Host) -or ($a.AbsolutePath -ne $b.AbsolutePath)
         } catch { }
     }
-    $watch.Stop()
-    $result.elapsed_ms = [int]$watch.ElapsedMilliseconds
-    if ($result.final_url) {
-        $a = [Uri]$Target; $b = [Uri]$result.final_url
-        $result.redirected = ($a.Scheme -ne $b.Scheme) -or ($a.Host -ne $b.Host) -or ($a.AbsolutePath -ne $b.AbsolutePath)
-    }
     return $result
+}
+
+function Test-Url([string]$Target, [int]$TimeoutSec = 20) {
+    # 保持既有返回结构；底层改为可直连的 Invoke-DirectHttpRequest（默认绕过系统代理）
+    $useProxy = Get-UseSystemProxy
+    $probe = Invoke-DirectHttpRequest -Uri $Target -TimeoutSec $TimeoutSec -UseProxy:$useProxy
+    $content = [string]$probe.body
+    if ($null -eq $content) { $content = '' }
+    return [ordered]@{
+        url = $Target
+        ok = [bool]$probe.ok
+        status = $probe.status
+        final_url = $probe.final_url
+        redirected = [bool]$probe.redirected
+        error = $probe.error
+        body_head = $content.Substring(0, [Math]::Min(1200, $content.Length))
+        # body_full 供登录流程解析隐藏字段/验证码；限制 512 KB 防止异常大页面
+        body_full = $content.Substring(0, [Math]::Min(524288, $content.Length))
+        elapsed_ms = $probe.elapsed_ms
+    }
 }
 
 function Get-LocalIPv4 {
@@ -226,15 +415,24 @@ function Get-ProxyState {
 }
 
 function Get-PublicIP {
+    # 公网 IP 探测：默认直连（绕过 Clash 等系统代理），失败时优雅返回 ok=$false
+    $useProxy = Get-UseSystemProxy
     $ipv4Pattern = '(\d{1,3}(?:\.\d{1,3}){3})'
     $ipv6Pattern = '((?:[0-9a-fA-F]{1,4}:){2,}[0-9a-fA-F]{1,4})'
-    foreach ($probe in @($settings.public_ip_probes)) {
+    foreach ($probe in @(Get-SettingValue 'public_ip_probes' @())) {
         if (-not $probe) { continue }
         try {
-            $item = [ordered]@{ probe = $probe; ip = $null; family = $null; ok = $false }
-            $response = Invoke-WebRequest -Uri $probe -UseBasicParsing -TimeoutSec 12 -UserAgent 'campus-library-papers status probe'
-            $text = if ($response.Content -is [byte[]]) { [Text.Encoding]::UTF8.GetString($response.Content) } else { [string]$response.Content }
-            $text = $text.Trim()
+            $item = [ordered]@{
+                probe = [string]$probe; ip = $null; family = $null; ok = $false
+                source = 'probe'; error = $null; used_system_proxy = [bool]$useProxy
+            }
+            $res = Invoke-DirectHttpRequest -Uri ([string]$probe) -TimeoutSec 12 -UseProxy:$useProxy
+            $item.used_system_proxy = [bool]$res.used_system_proxy
+            if (-not $res.ok) {
+                $item.error = if ($res.error) { [string]$res.error } else { "http_status_$($res.status)" }
+                continue
+            }
+            $text = ([string]$res.body).Trim()
             if ($text -match '"ip"\s*:\s*"([^"]+)"') {
                 $item.ip = $Matches[1]; $item.ok = $true
             } elseif ($text -match $ipv4Pattern) {
@@ -248,33 +446,36 @@ function Get-PublicIP {
             }
         } catch { }
     }
-    return [ordered]@{ probe = $null; ip = $null; family = $null; ok = $false }
+    return [ordered]@{
+        probe = $null; ip = $null; family = $null; ok = $false
+        source = 'probe'; error = 'all public IP probes failed'; used_system_proxy = [bool]$useProxy
+    }
 }
 
 function Get-CaptivePortalState {
+    # 强制门户探测同样直连（默认绕过系统代理）；失败只记录，不抛异常
+    $useProxy = Get-UseSystemProxy
     $state = [ordered]@{ detected = $false; probes = @() }
-    foreach ($probe in @($settings.captive_portal_probes)) {
+    foreach ($probe in @(Get-SettingValue 'captive_portal_probes' @())) {
         if (-not $probe) { continue }
         $item = [ordered]@{ url = $probe.url; expected = $probe.expect; ok = $false; status = $null; redirected = $false; final_url = $null; error = $null }
         try {
-            $response = Invoke-WebRequest -Uri $probe.url -UseBasicParsing -TimeoutSec 10 -MaximumRedirection 5 `
-                -UserAgent 'Mozilla/5.0 campus-library-papers captive probe'
-            $item.status = [int]$response.StatusCode
-            $item.final_url = Get-FinalUrl $response $probe.url
-            $text = if ($response.Content -is [byte[]]) { [Text.Encoding]::UTF8.GetString($response.Content) } else { [string]$response.Content }
+            $res = Invoke-DirectHttpRequest -Uri ([string]$probe.url) -TimeoutSec 10 -MaxRedirections 5 -UseProxy:$useProxy
+            $item.status = $res.status
+            $item.final_url = $res.final_url
+            $item.error = $res.error
+            $text = [string]$res.body
             if ($probe.expect -eq '204') {
                 $item.ok = ($item.status -eq 204)
             } else {
                 $item.ok = ($text -match [regex]::Escape([string]$probe.expect))
             }
             if ($item.final_url -and $item.final_url -notmatch [regex]::Escape(([Uri]$probe.url).Host)) { $item.redirected = $true }
-        } catch [System.Net.WebException] {
-            $response = $_.Exception.Response
-            if ($response -and $response.StatusCode) { $item.status = [int]$response.StatusCode }
-            $item.error = $_.Exception.Message
-            # 强制门户常以 3xx/4xx + 登录页形式出现
+            # 强制门户常以 3xx + 登录页形式出现（允许自动重定向时可能以 200 落地）
             if ($item.status -in @(301, 302, 303, 307, 308)) { $item.redirected = $true }
-        } catch { $item.error = $_.Exception.Message }
+        } catch {
+            $item.error = $_.Exception.Message
+        }
         # 只有"被劫持/被要求认证"才算强制门户；单纯探测超时不可达不算，避免误报
         $portalLike = $item.redirected -or ($item.status -in @(301, 302, 303, 307, 308)) -or ($item.status -eq 200 -and -not $item.ok -and [string]$probe.expect -ne '204')
         if ($portalLike) { $state.detected = $true }
@@ -344,6 +545,224 @@ function Test-CidrContains([string]$Ip, [string]$Cidr) {
     } catch { return $false }
 }
 
+function Test-NonPublicIpv4([string]$Ip) {
+    # 私网 / 保留 / 文档测试网段：不是真实公网出口，不做 CERNET AS 查询
+    try {
+        $bytes = [System.Net.IPAddress]::Parse($Ip).GetAddressBytes()
+        if ($bytes.Length -ne 4) { return $false }
+        if ($bytes[0] -eq 10) { return $true }
+        if ($bytes[0] -eq 127) { return $true }
+        if ($bytes[0] -eq 172 -and $bytes[1] -ge 16 -and $bytes[1] -le 31) { return $true }
+        if ($bytes[0] -eq 192 -and $bytes[1] -eq 168) { return $true }
+        if ($bytes[0] -eq 169 -and $bytes[1] -eq 254) { return $true }
+        if ($bytes[0] -eq 100 -and $bytes[1] -ge 64 -and $bytes[1] -le 127) { return $true }
+        if ($bytes[0] -eq 192 -and $bytes[1] -eq 0 -and $bytes[2] -eq 2) { return $true }   # TEST-NET-1
+        if ($bytes[0] -eq 198 -and $bytes[1] -eq 51 -and $bytes[2] -eq 100) { return $true } # TEST-NET-2
+        if ($bytes[0] -eq 203 -and $bytes[1] -eq 0 -and $bytes[2] -eq 113) { return $true }   # TEST-NET-3
+        return $false
+    } catch { return $false }
+}
+
+function Get-RqIpFromText([string]$Text) {
+    # 图书馆页面常由服务端写入 rqIp（如 var rqIp = '10.82.x.x'），是校园内部出口的弱证据
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $match = [regex]::Match($Text, 'rqIp\s*[=:]\s*[''"]([^''"]+)[''"]')
+    if ($match.Success) { return $match.Groups[1].Value }
+    return $null
+}
+
+function ConvertFrom-CernetPayload {
+    # 从 ipinfo.io / api.bgpview.io 的响应里提取 ASN 与组织名（解析失败不抛异常）
+    param([string]$Text)
+    $info = [ordered]@{ asn = $null; asn_name = $null; org = $null; parse = 'none'; error = $null }
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $info }
+    $json = $null
+    try {
+        $json = $Text.Trim() | ConvertFrom-Json -ErrorAction Stop
+        $info.parse = 'json'
+    } catch {
+        $info.error = $_.Exception.Message
+    }
+    if ($json) {
+        # ipinfo.io: {"org":"AS4538 China Education and Research Network Center"}
+        try {
+            $org = [string]$json.org
+            if ($org) {
+                $info.org = $org
+                $match = [regex]::Match($org, 'AS\s?(\d{2,6})')
+                if ($match.Success) {
+                    $info.asn = [int]$match.Groups[1].Value
+                    $info.asn_name = ($org -replace '^\s*AS\s?\d{2,6}\s*', '').Trim()
+                }
+            }
+        } catch { }
+        # 某些接口把 asn 放在对象里：{"asn":{"asn":4538,"name":"..."}}
+        if (-not $info.asn) {
+            try {
+                $asnValue = $json.asn
+                if ($null -ne $asnValue) {
+                    if ($asnValue -is [string] -or $asnValue -is [int] -or $asnValue -is [long]) {
+                        $match = [regex]::Match([string]$asnValue, 'AS?\s?(\d{2,6})')
+                        if ($match.Success) { $info.asn = [int]$match.Groups[1].Value }
+                    } else {
+                        try { if ($asnValue.asn) { $info.asn = [int]$asnValue.asn } } catch { }
+                        try { if (-not $info.asn_name) { $info.asn_name = [string]$asnValue.name } } catch { }
+                    }
+                }
+            } catch { }
+        }
+        # api.bgpview.io: {"data":{"prefixes":[{"asn":{"asn":4538,"name":"CERNET"}}]}}
+        if (-not $info.asn) {
+            try {
+                foreach ($prefix in @($json.data.prefixes)) {
+                    if ($null -eq $prefix) { continue }
+                    try { if ($prefix.asn.asn) { $info.asn = [int]$prefix.asn.asn } } catch { }
+                    if ($info.asn) {
+                        try { $info.asn_name = [string]$prefix.asn.name } catch { }
+                        if (-not $info.asn_name) { try { $info.asn_name = [string]$prefix.asn.description } catch { } }
+                        break
+                    }
+                }
+            } catch { }
+        }
+        if ($info.asn -and -not $info.asn_name) {
+            foreach ($name in @('name', 'description', 'asn_name')) {
+                try {
+                    $value = [string]$json.$name
+                    if ($value) { $info.asn_name = $value; break }
+                } catch { }
+            }
+        }
+    }
+    if (-not $info.asn) {
+        # 兜底：纯文本里的 AS 号
+        $match = [regex]::Match($Text, 'AS\s?(\d{2,6})')
+        if ($match.Success) { $info.asn = [int]$match.Groups[1].Value }
+        if (-not $info.org) {
+            $matchOrg = [regex]::Match($Text, '"org"\s*:\s*"([^"]+)"')
+            if ($matchOrg.Success) { $info.org = $matchOrg.Groups[1].Value }
+        }
+    }
+    return $info
+}
+
+function Get-CernetLookupTimeout {
+    # 验收要求单次查询超时 ≤8s
+    $timeout = 8
+    try {
+        $raw = Get-SectionSetting 'cernet' 'timeout_seconds' 8
+        if ($raw) { $timeout = [int]$raw }
+    } catch { $timeout = 8 }
+    if ($timeout -le 0) { $timeout = 8 }
+    if ($timeout -gt 8) { $timeout = 8 }
+    return $timeout
+}
+
+function Get-CernetEvidence([string]$Ip) {
+    # 公网 IP 的 CERNET AS 证据：仅作判定证据，任何失败都返回 null 而不是抛异常
+    $evidence = [ordered]@{
+        checked = $false; ip = $Ip; asn = $null; asn_name = $null; org = $null
+        is_cernet = $null; source = $null; error = $null; lookups = @(); elapsed_ms = $null
+    }
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        if ([string]::IsNullOrWhiteSpace($Ip)) { $evidence.error = 'no_public_ip'; return $evidence }
+        if ($Ip -match ':') { $evidence.error = 'ipv6_lookup_not_supported'; return $evidence }
+        if ($Ip -notmatch '^\d{1,3}(?:\.\d{1,3}){3}$') { $evidence.error = 'invalid_ip'; return $evidence }
+        if (Test-NonPublicIpv4 $Ip) { $evidence.error = 'private_or_reserved_ip'; return $evidence }
+        if (-not [bool](Get-SectionSetting 'cernet' 'lookup_enabled' $true)) {
+            $evidence.error = 'lookup_disabled'
+            return $evidence
+        }
+        $timeout = Get-CernetLookupTimeout
+        $urls = @(Get-SectionSetting 'cernet' 'lookup_urls' @('https://ipinfo.io/{ip}/json', 'https://api.bgpview.io/ip/{ip}'))
+        $expectedAsns = @()
+        foreach ($value in @(Get-SectionSetting 'cernet' 'expected_asns' @(4538))) {
+            try { if ($null -ne $value) { $expectedAsns += [int]$value } } catch { }
+        }
+        if ($expectedAsns.Count -eq 0) { $expectedAsns = @(4538) }
+        $markers = @(Get-SectionSetting 'cernet' 'org_markers' @('CERNET', 'China Education and Research Network', '教育网', '中国教育和科研计算机网'))
+        $errors = @()
+        foreach ($template in $urls) {
+            if (-not $template) { continue }
+            $url = ([string]$template).Replace('{ip}', $Ip)
+            $lookup = [ordered]@{ url = $url; ok = $false; status = $null; asn = $null; asn_name = $null; error = $null }
+            try {
+                # 必须直连：走系统代理会拿到代理节点的 AS，证据无效
+                $res = Invoke-DirectHttpRequest -Uri $url -TimeoutSec $timeout -UseProxy:$false
+                $lookup.status = $res.status
+                if ($res.ok) {
+                    $parsed = ConvertFrom-CernetPayload ([string]$res.body)
+                    $lookup.asn = $parsed.asn
+                    $lookup.asn_name = $parsed.asn_name
+                    if ($parsed.asn) {
+                        $lookup.ok = $true
+                        $evidence.asn = $parsed.asn
+                        $evidence.asn_name = $parsed.asn_name
+                        $evidence.org = $parsed.org
+                        $evidence.source = $url
+                    } else {
+                        $lookup.error = 'asn_not_found'
+                        $errors += "$url => asn_not_found"
+                    }
+                } else {
+                    $lookup.error = if ($res.error) { [string]$res.error } else { "http_status_$($res.status)" }
+                    $errors += "$url => $($lookup.error)"
+                }
+            } catch {
+                $lookup.error = $_.Exception.Message
+                $errors += "$url => $($lookup.error)"
+            }
+            $evidence.lookups += $lookup
+            if ($evidence.asn) { break }
+        }
+        $evidence.checked = $true
+        if ($evidence.asn) {
+            $asnNumber = [int]$evidence.asn
+            $isCernet = $null
+            if ($expectedAsns -contains $asnNumber) { $isCernet = $true }
+            if ($isCernet -ne $true -and $evidence.asn_name) {
+                foreach ($marker in $markers) {
+                    if ($marker -and ([string]$evidence.asn_name).ToLowerInvariant().Contains(([string]$marker).ToLowerInvariant())) {
+                        $isCernet = $true
+                        break
+                    }
+                }
+            }
+            if ($null -eq $isCernet) { $isCernet = $false }  # ASN 已知且不是 CERNET
+            $evidence.is_cernet = $isCernet
+        } else {
+            $evidence.error = if ($errors.Count -gt 0) { ($errors -join '; ') } else { 'lookup_failed' }
+        }
+    } catch {
+        $evidence.error = $_.Exception.Message
+    } finally {
+        $watch.Stop()
+        $evidence.elapsed_ms = [int]$watch.ElapsedMilliseconds
+    }
+    return $evidence
+}
+
+function Format-StatusValue($Value) {
+    # 人类可读输出：空值统一显示 unknown，不留下空白
+    if ($null -eq $Value) { return 'unknown' }
+    if ($Value -is [bool]) { if ($Value) { return 'true' } return 'false' }
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return 'unknown' }
+    return $text
+}
+
+function Ensure-ResultField($Object, [string]$Name, $Default = $null) {
+    if ($null -eq $Object) { return }
+    try {
+        if ($Object -is [System.Collections.IDictionary]) {
+            if (-not $Object.Contains($Name)) { $Object[$Name] = $Default }
+        } elseif ($null -eq $Object.PSObject.Properties[$Name]) {
+            $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Default -Force
+        }
+    } catch { }
+}
+
 function Invoke-WebVpnProbe {
     # 用一条重写 URL 探测 WebVPN 是否已登录：302 -> /login 表示未登录；200 表示已登录。
     # 关键：未登录访问 /login 也会下发同名 ticket，所以不能只看 Cookie 是否存在。
@@ -351,7 +770,7 @@ function Invoke-WebVpnProbe {
         target = $null; rewritten = $null; status = $null; redirect = $null
         logged_in = $null; method = $null; error = $null
     }
-    $target = [string]$settings.webvpn.probe_target
+    $target = [string](Get-SectionSetting 'webvpn' 'probe_target' '')
     if (-not $target) { return $probe }
     $probe.target = $target
     $script = Join-Path $ScriptDir 'webvpn_url.py'
@@ -361,7 +780,7 @@ function Invoke-WebVpnProbe {
         return $probe
     }
     try {
-        $out = & $python $script --base ([string]$settings.webvpn.base) $target 2>$null
+        $out = & $python $script --base ([string](Get-SectionSetting 'webvpn' 'base' '')) $target 2>$null
         if ($LASTEXITCODE -ne 0 -or -not $out) { $probe.error = 'webvpn_url.py 生成探测 URL 失败'; return $probe }
         $probe.rewritten = ([string]($out | Select-Object -Last 1)).Trim()
     } catch {
@@ -370,7 +789,11 @@ function Invoke-WebVpnProbe {
     }
     if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
         try {
-            $raw = & curl.exe -s -o NUL -w '%{http_code}|%{redirect_url}' --max-time 20 $probe.rewritten 2>$null
+            $curlArgs = @('-s', '-o', 'NUL', '-w', '%{http_code}|%{redirect_url}', '--max-time', '20')
+            # 与 status 探测保持一致：默认直连，忽略 HTTP(S)_PROXY 环境变量
+            if (-not (Get-UseSystemProxy)) { $curlArgs += '--noproxy'; $curlArgs += '*' }
+            $curlArgs += $probe.rewritten
+            $raw = & curl.exe @curlArgs 2>$null
             $probe.method = 'curl'
             $parts = ([string]$raw).Split('|')
             if ($parts.Count -ge 1 -and $parts[0] -match '^\d+$') { $probe.status = [int]$parts[0] }
@@ -392,113 +815,283 @@ function Invoke-WebVpnProbe {
 }
 
 function Get-NetworkStatus {
+    $useProxy = Get-UseSystemProxy
+    $effectiveCidrs = @(Get-CampusCidrSet)
+    $effectivePrivateCidrs = @(Get-CampusPrivateCidrSet)
+
     $localIps = @(Get-LocalIPv4)
     $cidrHits = @()
+    $privateHits = @()
     foreach ($entry in $localIps) {
-        foreach ($cidr in @($settings.campus_cidrs)) {
-            if ($cidr -and (Test-CidrContains $entry.IPAddress ([string]$cidr))) {
-                $cidrHits += [ordered]@{ ip = $entry.IPAddress; cidr = $cidr; iface = $entry.InterfaceAlias }
+        if (-not $entry -or -not $entry.IPAddress) { continue }
+        $ip = [string]$entry.IPAddress
+        foreach ($cidr in $effectiveCidrs) {
+            if ($cidr -and (Test-CidrContains $ip ([string]$cidr))) {
+                $cidrHits += [ordered]@{ ip = $ip; cidr = [string]$cidr; iface = $entry.InterfaceAlias; source = 'local_ip' }
+            }
+        }
+        foreach ($cidr in $effectivePrivateCidrs) {
+            if ($cidr -and (Test-CidrContains $ip ([string]$cidr))) {
+                $privateHits += [ordered]@{ ip = $ip; cidr = [string]$cidr; iface = $entry.InterfaceAlias; source = 'local_ip' }
             }
         }
     }
 
     $probes = @()
-    foreach ($probe in @($settings.on_campus_probes)) {
+    foreach ($probe in @(Get-SettingValue 'on_campus_probes' @())) {
         if ($probe -and $probe.url) { $probes += (Test-CampusProbe $probe) }
     }
 
     $captive = Get-CaptivePortalState
+    if ($null -eq $captive) { $captive = [ordered]@{ detected = $false; probes = @() } }
+    Ensure-ResultField $captive 'detected' $false
+    Ensure-ResultField $captive 'probes' @()
+    $captiveDetected = $false
+    try { $captiveDetected = [bool]$captive.detected } catch { }
+    $captiveProbes = @()
+    try { if ($captive.probes) { $captiveProbes = @($captive.probes) } } catch { }
+
     $publicIp = Get-PublicIP
-    $proxy = Get-ProxyState
-    # 公网 IP 探测都失败时，回退读图书馆首页服务端写入的 rqIp（弱证据，但通常就是出口 IP）
-    if (-not $publicIp.ok) {
+    if ($null -eq $publicIp) { $publicIp = [ordered]@{} }
+    foreach ($field in @('probe', 'ip', 'family', 'ok', 'source', 'error', 'used_system_proxy')) {
+        $default = $false
+        if ($field -in @('probe', 'ip', 'family', 'source', 'error')) { $default = $null }
+        Ensure-ResultField $publicIp $field $default
+    }
+
+    # 公网 IP 探测都失败时，回退读图书馆页面服务端写入的 rqIp（弱证据，但通常就是出口 IP）
+    $rqIpSource = $null
+    if (-not [bool]$publicIp.ok) {
         foreach ($probe in $probes) {
             if (-not $probe.url) { continue }
             $pageText = [string]$probe.body_head
-            # rqIp 常出现在 1200 字符之后：必要时重新抓整页（Test-Url.body_full）
-            if ($pageText -notmatch 'rqIp') {
+            $rqIp = Get-RqIpFromText $pageText
+            if (-not $rqIp) {
+                # rqIp 常出现在 1200 字符之后：必要时重新抓整页
                 $page = Test-Url $probe.url
-                $pageText = [string]$page.body_full
+                $rqIp = Get-RqIpFromText ([string]$page.body_full)
             }
-            $match = [regex]::Match($pageText, "rqIp\s*=\s*'([^']+)'")
-            if (-not $match.Success) { $match = [regex]::Match($pageText, 'rqIp\s*=\s*"([^"]+)"') }
-            if ($match.Success) {
-                $ip = $match.Groups[1].Value
+            if ($rqIp) {
                 $publicIp = [ordered]@{
-                    probe = $probe.url; ip = $ip; ok = $true
-                    family = if ($ip -match ':') { 'IPv6' } else { 'IPv4' }
-                    source = 'probe-rqIp'
+                    probe = $probe.url; ip = $rqIp; ok = $true
+                    family = if ($rqIp -match ':') { 'IPv6' } else { 'IPv4' }
+                    source = 'probe-rqIp'; error = $null; used_system_proxy = [bool]$useProxy
                 }
+                $rqIpSource = $probe.url
                 break
             }
         }
     }
 
-    $vpn = [ordered]@{ enabled = [bool]$settings.webvpn.enabled; base = $settings.webvpn.base; reachable = $false; logged_in = $null; status = $null; final_url = $null; error = $null; cookie_env_set = $false; probe = $null }
-    $vpn.cookie_env_set = [bool](Get-Item -Path "Env:$($settings.webvpn.cookie_env)" -ErrorAction SilentlyContinue)
-    if ($vpn.enabled -and $vpn.base) {
-        $vpnRes = Test-Url ($vpn.base.TrimEnd('/') + '/')
+    $publicIpText = if ([bool]$publicIp.ok) { [string]$publicIp.ip } else { '' }
+    $publicIpPrivate = [bool]($publicIpText -and (Test-NonPublicIpv4 $publicIpText))
+    $publicCidrHits = @()
+    $rqIpHit = $null
+    if ($publicIpText) {
+        foreach ($cidr in $effectiveCidrs) {
+            if (Test-CidrContains $publicIpText ([string]$cidr)) {
+                $publicCidrHits += [ordered]@{ ip = $publicIpText; cidr = [string]$cidr; iface = ''; source = 'public_ip' }
+            }
+        }
+        if ($publicIpPrivate) {
+            foreach ($cidr in $effectivePrivateCidrs) {
+                if (Test-CidrContains $publicIpText ([string]$cidr)) { $rqIpHit = [string]$cidr; break }
+            }
+        }
+    }
+
+    # CERNET AS 证据（仅公网 IP、仅直连；失败不影响判定）
+    $cernet = [ordered]@{
+        checked = $false; ip = $null; asn = $null; asn_name = $null; org = $null
+        is_cernet = $null; source = $null; error = $null; lookups = @(); elapsed_ms = $null
+    }
+    if ($publicIpText) {
+        $cernet.ip = $publicIpText
+        if ($publicIpPrivate) {
+            $cernet.error = 'private_or_reserved_ip'
+        } elseif ($publicCidrHits.Count -gt 0) {
+            # 先比 CIDR：已命中校园网段就无需再查 AS，节省一次网络往返
+            $cernet.error = 'skipped_public_ip_cidr_hit'
+        } else {
+            $cernet = Get-CernetEvidence $publicIpText
+        }
+    } else {
+        $cernet.error = 'no_public_ip'
+    }
+    if ($null -eq $cernet) { $cernet = [ordered]@{} }
+    foreach ($field in @('checked', 'ip', 'asn', 'asn_name', 'org', 'is_cernet', 'source', 'error', 'lookups', 'elapsed_ms')) {
+        $default = $null
+        if ($field -eq 'checked') { $default = $false }
+        if ($field -eq 'lookups') { $default = @() }
+        Ensure-ResultField $cernet $field $default
+    }
+
+    # 代理状态：扩展既有结构，明确本机探测是否绕过系统代理
+    $proxy = Get-ProxyState
+    if ($null -eq $proxy) { $proxy = [ordered]@{} }
+    foreach ($field in @('env_http_proxy', 'env_https_proxy', 'no_proxy', 'registry')) {
+        Ensure-ResultField $proxy $field $null
+    }
+    $proxyMode = if ($useProxy) { 'system' } else { 'direct' }
+    try {
+        $proxy['use_system_proxy'] = [bool]$useProxy
+        $proxy['mode'] = $proxyMode
+        $proxy['bypassed'] = (-not $useProxy)
+        $proxy['note'] = if ($useProxy) {
+            'status 探测使用系统代理（可能把出口判成代理节点，校园网判定可能失效）'
+        } else {
+            'status 探测使用直连（HttpWebRequest.Proxy=$null），绕过 Clash 等系统代理'
+        }
+    } catch { }
+
+    # WebVPN：保留独立 HTTP 会话语义，同时给出 vpn_state 文本
+    $vpnEnabled = [bool](Get-SectionSetting 'webvpn' 'enabled' $false)
+    $vpnBase = [string](Get-SectionSetting 'webvpn' 'base' '')
+    $vpnCookieEnv = [string](Get-SectionSetting 'webvpn' 'cookie_env' '')
+    $vpn = [ordered]@{
+        enabled = $vpnEnabled; base = $vpnBase; reachable = $false; logged_in = $null
+        status = $null; final_url = $null; error = $null; cookie_env_set = $false
+        probe = $null; http_probe_logged_in = $null
+    }
+    $vpn.cookie_env_set = [bool]($vpnCookieEnv -and (Get-Item -Path "Env:$vpnCookieEnv" -ErrorAction SilentlyContinue))
+    if ($vpnEnabled -and $vpnBase) {
+        $vpnRes = Test-Url ($vpnBase.TrimEnd('/') + '/')
         $vpn.reachable = [bool]$vpnRes.ok
         $vpn.status = $vpnRes.status
         $vpn.final_url = $vpnRes.final_url
         $vpn.error = $vpnRes.error
-        if ($vpnRes.ok) {
-            $bodyLower = ([string]$vpnRes.body_head).ToLowerInvariant()
-            $hasLogin = $false
-            foreach ($marker in @($settings.webvpn.login_markers)) {
-                if ($marker -and $bodyLower.Contains(([string]$marker).ToLowerInvariant())) { $hasLogin = $true; break }
-            }
-            $vpn.logged_in = $null # This HTTP session is independent of the browser
-        }
         # 更强的判据：重写 URL 是否 302 到 /login
         $vpn.probe = Invoke-WebVpnProbe
-        if ($vpn.probe -and $vpn.probe.logged_in -ne $null) { $vpn.logged_in = $vpn.probe.logged_in }
+        if ($vpn.probe) {
+            try { $vpn.http_probe_logged_in = $vpn.probe.logged_in } catch { }
+        }
+        if ($null -ne $vpn.http_probe_logged_in) { $vpn.logged_in = $vpn.http_probe_logged_in }
     }
+    # CLI 独立 HTTP 探测不能代表当前浏览器会话，保持既有 webvpn.logged_in=null 语义
+    $vpn.logged_in = $null
 
-    $carsi = [ordered]@{ enabled = [bool]$settings.carsi.enabled; portal = $settings.carsi.portal; idp_entity_id = $settings.carsi.idp_entity_id; reachable = $null }
-    if ($carsi.enabled -and $carsi.portal) {
-        $carsiRes = Test-Url ([string]$carsi.portal)
+    $carsiEnabled = [bool](Get-SectionSetting 'carsi' 'enabled' $false)
+    $carsiPortal = [string](Get-SectionSetting 'carsi' 'portal' '')
+    $carsi = [ordered]@{
+        enabled = $carsiEnabled; portal = $carsiPortal
+        idp_entity_id = [string](Get-SectionSetting 'carsi' 'idp_entity_id' ''); reachable = $null
+    }
+    if ($carsiEnabled -and $carsiPortal) {
+        $carsiRes = Test-Url $carsiPortal
         $carsi.reachable = [bool]$carsiRes.ok
     }
 
-    $onCampus = $null
+    # ---------------- 校园网判定（on_campus / on_campus_reason）
     $authenticatedProbes = @($probes | Where-Object { $_.authenticated -eq $true })
-    if ($authenticatedProbes.Count -gt 0) { $onCampus = $true }
-    elseif ($probes.Count -gt 0 -and ($probes | Where-Object { $_.authenticated -eq $false -or $_.login_wall })) { $onCampus = $false }
+    $loginWallProbes = @($probes | Where-Object { $_.login_wall -eq $true -or $_.authenticated -eq $false })
+    $onCampus = $null
+    $onCampusReason = 'unknown'
+    $onCampusEvidence = @()
+    if ($cidrHits.Count -gt 0) {
+        $onCampus = $true; $onCampusReason = 'campus_cidr'
+        $onCampusEvidence += "local_ip=$($cidrHits[0].ip) in $($cidrHits[0].cidr)"
+    } elseif ($authenticatedProbes.Count -gt 0) {
+        $onCampus = $true; $onCampusReason = 'probe'
+        $onCampusEvidence += "probe_authenticated=$($authenticatedProbes[0].url)"
+    } elseif ($publicCidrHits.Count -gt 0) {
+        $onCampus = $true; $onCampusReason = 'public_ip_cidr'
+        $onCampusEvidence += "public_ip=$publicIpText in $($publicCidrHits[0].cidr)"
+    } elseif ($publicIpPrivate -and $rqIpHit) {
+        $onCampus = $null; $onCampusReason = 'library_rqip'
+        $onCampusEvidence += "rqIp=$publicIpText in $rqIpHit"
+    } elseif ($privateHits.Count -gt 0) {
+        $onCampus = $null; $onCampusReason = 'campus_lan_private'
+        $onCampusEvidence += "local_private_ip=$($privateHits[0].ip) in $($privateHits[0].cidr)"
+    } elseif ($cernet.is_cernet -eq $true) {
+        $onCampus = $null; $onCampusReason = 'cernet_as'
+        $onCampusEvidence += "public_ip=$publicIpText AS$($cernet.asn)"
+    } elseif ($loginWallProbes.Count -gt 0) {
+        $onCampus = $false; $onCampusReason = 'login_wall'
+        $onCampusEvidence += "probe_login_wall=$($loginWallProbes[0].url)"
+    } elseif ($captiveDetected) {
+        $onCampus = $false; $onCampusReason = 'captive_portal'
+        $onCampusEvidence += 'captive_portal_detected'
+    } elseif ($cernet.checked -and $cernet.is_cernet -eq $false) {
+        $onCampus = $false; $onCampusReason = 'cernet_as_negative'
+        $onCampusEvidence += "public_ip=$publicIpText AS$($cernet.asn) not CERNET"
+    } else {
+        $onCampus = $null; $onCampusReason = 'unknown'
+        if ($publicIpText) { $onCampusEvidence += "public_ip=$publicIpText 未命中校园网段且无 CERNET 证据" }
+        else { $onCampusEvidence += '无可用公网 IP 或探测证据' }
+    }
 
+    # ---------------- VPN 状态
     $vpnConnected = $null
-    # CLI HTTP probes never establish the current browser session status.
-    $vpn.http_probe_logged_in = $vpn.logged_in
-    $vpn.logged_in = $null
+    $vpnState = 'unknown'
+    if ($onCampus -eq $true) {
+        $vpnConnected = $false
+        $vpnState = 'campus_direct'
+    } elseif (-not $vpnEnabled) {
+        $vpnState = 'disabled'
+    } elseif (-not $vpnBase) {
+        $vpnState = 'not_configured'
+    } elseif (-not $vpn.reachable) {
+        $vpnState = 'webvpn_unreachable'
+    } elseif ($vpn.http_probe_logged_in -eq $true) {
+        $vpnConnected = $true
+        $vpnState = 'webvpn_http_session_logged_in'
+    } elseif ($vpn.http_probe_logged_in -eq $false) {
+        if ($onCampus -eq $false) {
+            $vpnConnected = $false
+            $vpnState = 'webvpn_login_required'
+        } else {
+            # 独立 HTTP 会话未登录，但不能否定用户浏览器已登录
+            $vpnState = 'webvpn_login_required_independent_session'
+        }
+    } elseif ($vpn.probe) {
+        $vpnState = 'webvpn_probe_inconclusive'
+    } else {
+        $vpnState = 'browser_session_not_observed'
+    }
 
-    $recommendation = 'unknown'
+    $recommendation = 'oa_or_vpn'
     if ($onCampus -eq $true) { $recommendation = 'direct' }
     elseif ($vpnConnected -eq $true) { $recommendation = 'vpn' }
-    elseif ($onCampus -eq $false) { $recommendation = 'oa_or_vpn' }
+
+    $campusCidrHits = @($cidrHits) + @($publicCidrHits)
+    $privateCidrHits = @($privateHits)
+    if ($publicIpPrivate -and $rqIpHit) {
+        $privateCidrHits += [ordered]@{ ip = $publicIpText; cidr = $rqIpHit; iface = ''; source = 'rqIp' }
+    }
 
     return [ordered]@{
         probe_scope = 'independent_http_session'
         browser_session = 'not_observed'
         checked_at = (Get-Date).ToString('o')
-        config_path = $settings._config_path
-        school = $settings.school.name
+        config_path = [string](Get-SettingValue '_config_path' '')
+        school = [string](Get-SectionSetting 'school' 'name' '')
         on_campus = $onCampus
+        on_campus_reason = $onCampusReason
+        on_campus_evidence = @($onCampusEvidence)
         vpn_connected = $vpnConnected
-        captive_portal_detected = $captive.detected
+        vpn_state = $vpnState
+        captive_portal_detected = $captiveDetected
         recommendation = $recommendation
+        proxy = $proxy
         local_ipv4 = @($localIps)
-        campus_cidr_hits = @($cidrHits)
+        campus_cidrs = @($effectiveCidrs)
+        campus_private_cidrs = @($effectivePrivateCidrs)
+        campus_cidr_hits = @($campusCidrHits)
+        campus_private_cidr_hits = @($privateCidrHits)
+        public_ip = $publicIp
+        cernet = $cernet
         campus_probes = @($probes)
-        captive_portal_probes = @($captive.probes)
+        captive_portal_probes = @($captiveProbes)
         webvpn = $vpn
         carsi = $carsi
-        public_ip = $publicIp
-        proxy = $proxy
         hints = @(
-            'on_campus=true 仅说明已配置的受限探测页通过；目标论文订阅权限仍需逐篇核验',
+            'on_campus=true 表示网络位置（内置 WHUT 网段 / CERNET AS4538 / 受限探测命中），不代表目标论文有订阅权限；仍需逐篇核验',
             'on_campus=false -> 优先 CARSI（carsi.portal）按库做机构登录；WebVPN 作备选；纯 OA 论文可直接脚本下载',
-            'vpn_connected=null：脚本不能判断浏览器会话；用户已登录时直接继续原浏览器，不重复要求登录',
-            'on_campus=null -> 探测页无法判断，请人工确认或补充 on_campus_probes / campus_cidrs'
+            'on_campus=null -> 证据不足，按校外默认处理：先 OA，再 CARSI/WebVPN；可补充 campus_cidrs / on_campus_probes',
+            'vpn_connected=null 表示无法判断浏览器会话；用户已登录时直接继续原浏览器，不重复要求登录',
+            'status 探测默认直连（HttpWebRequest.Proxy=$null）绕过 Clash 等系统代理；要临时走系统代理加 -UseSystemProxy',
+            'campus_private_cidrs（10.82/16、10.83/16）为校园 LAN 弱证据，可能与其他单位私网重叠',
+            'CERNET AS 只说明出口属于教育网，可能对应其他高校；WHUT 判定优先看 campus_cidrs'
         )
     }
 }
@@ -714,14 +1307,32 @@ $exitCode = 0
 switch ($Action) {
     'status' {
         $status = Get-NetworkStatus
+        $localIpText = 'unknown'
+        if (@($status.local_ipv4).Count -gt 0) {
+            $localIpText = (@($status.local_ipv4 | ForEach-Object { $_.IPAddress }) -join ', ')
+        }
+        $hitItems = @($status.campus_cidr_hits) + @($status.campus_private_cidr_hits)
+        $campusHitText = 'none'
+        if ($hitItems.Count -gt 0) {
+            $campusHitText = (@($hitItems | ForEach-Object { "$($_.ip)@$($_.cidr)" }) -join ', ')
+        }
+        $cernetText = 'unknown'
+        if ($status.cernet -and $status.cernet.checked) {
+            $cernetText = "$(Format-StatusValue $status.cernet.asn) $(Format-StatusValue $status.cernet.asn_name) (is_cernet=$(Format-StatusValue $status.cernet.is_cernet))"
+        }
         $human = @(
             "网络状态：",
-            "  on_campus        = $($status.on_campus)",
-            "  vpn_connected    = $($status.vpn_connected)",
-            "  captive_portal   = $($status.captive_portal_detected)",
-            "  recommendation   = $($status.recommendation)",
-            "  公网 IP          = $($status.public_ip.ip)",
-            "  本地 IPv4        = $(@($status.local_ipv4 | ForEach-Object { $_.IPAddress }) -join ', ')"
+            "  on_campus        = $(Format-StatusValue $status.on_campus)",
+            "  on_campus_reason = $(Format-StatusValue $status.on_campus_reason)",
+            "  vpn_connected    = $(Format-StatusValue $status.vpn_connected)",
+            "  vpn_state        = $(Format-StatusValue $status.vpn_state)",
+            "  captive_portal   = $(Format-StatusValue $status.captive_portal_detected)",
+            "  recommendation   = $(Format-StatusValue $status.recommendation)",
+            "  公网 IP          = $(Format-StatusValue $status.public_ip.ip)",
+            "  CERNET AS        = $cernetText",
+            "  系统代理         = $(Format-StatusValue $status.proxy.use_system_proxy)",
+            "  校园网命中       = $campusHitText",
+            "  本地 IPv4        = $localIpText"
         ) -join "`n"
         Write-Result $status $human
     }
@@ -732,6 +1343,23 @@ switch ($Action) {
     }
     'save-cred' {
         Save-DpapiCredential
+    }
+    'carsi' {
+        # CARSI 按数据库做机构登录：这里只打开学校 CARSI 门户，具体数据库由用户选择
+        $portal = [string](Get-SectionSetting 'carsi' 'portal' '')
+        if (-not $portal) {
+            Write-Result ([ordered]@{ status = 'error'; reason = '配置缺少 carsi.portal' })
+            $exitCode = 2
+        } else {
+            try {
+                Start-Process $portal
+                Write-Result ([ordered]@{ status = 'opened'; url = $portal;
+                    note = '已打开 CARSI 门户；请选择目标数据库并用学校账号登录，验证码由用户完成' }) "已在默认浏览器打开 CARSI：$portal"
+            } catch {
+                Write-Result ([ordered]@{ status = 'error'; reason = "无法打开浏览器：$($_.Exception.Message)" })
+                $exitCode = 1
+            }
+        }
     }
     'vpn-url' {
         $result = Invoke-WebVpnRewrite

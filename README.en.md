@@ -6,7 +6,7 @@ A local workflow for institutional access, specific-paper retrieval, PDF verific
 
 ![Campus resource access, paper retrieval, verification and records](docs/images/project-overview.svg)
 
-[Download v2.0.0](https://github.com/PengyuLaider/WUT-Acadamic-Download/releases/tag/v2.0.0) · [Get started](#start-the-portal) · [Capabilities](#capabilities-and-limits) · [Outputs](#what-you-get) · [FAQ](#frequently-asked-questions)
+[Download v2.1.0](https://github.com/PengyuLaider/WUT-Acadamic-Download/releases/tag/v2.1.0) · [Get started](#start-the-portal) · [Capabilities](#capabilities-and-limits) · [Outputs](#what-you-get) · [FAQ](#frequently-asked-questions)
 
 ![Offline checks](https://github.com/PengyuLaider/WUT-Acadamic-Download/actions/workflows/test.yml/badge.svg?branch=main)
 
@@ -91,7 +91,7 @@ python campus_portal.py
 Keep the terminal open and use the local browser page. Stop the service with **Ctrl+C**. Do not disable security software or restore a quarantined legacy launcher.
 
 - Select **中文 / EN** in the header. Only the language preference is stored in browser local storage.
-- Enter your campus account and password. The portal saves them in the local plain-text file `登录配置.private.json`.
+- Enter your campus account and password. The portal encrypts them with Windows DPAPI in `登录配置.private.dpapi`; plaintext requires explicit --no-dpapi.
 - Existing credentials are not returned to the page. Blank fields preserve saved values; changing the account requires the corresponding password.
 - The optional automatic submission setting permits one click only when no CAPTCHA is detected. CAPTCHA, QR-code and SMS verification remain your responsibility.
 
@@ -173,7 +173,7 @@ This demonstrates how to phrase a task, not a guarantee that this paper can be d
 | Version | Purpose | What it contains |
 |---|---|---|
 | v1.0.0 | Historical compatibility | The original CLI-oriented implementation, preserved at the original main commit |
-| v2.0.0 | Recommended for new users | Local configuration portal, Chinese/English interface, verification, documentation and tests |
+| v2.1.0 | Recommended for new users | Local configuration portal, Chinese/English interface, verification, documentation and tests |
 | main | Current maintained source | The latest integrated version; feature branches are merged here through pull requests |
 
 Version 1 remains a historical snapshot rather than being overwritten. See [release notes](CHANGELOG.md). New releases are built from the version recorded in `VERSION` only after tests pass. Existing releases are not replaced.
@@ -184,7 +184,7 @@ Version 1 remains a historical snapshot rather than being overwritten. See [rele
 main                 latest integrated source
 feature branch       work in progress, merged through a pull request
 v1.0.0               preserved original version
-v2.0.0               current portal-oriented release
+v2.1.0               current portal-oriented release
 ```
 
 The repository tracks source, examples, docs and tests. Papers, private configurations, browser profiles, caches and backups are excluded from the current source tree. Historical commits remain unchanged.
@@ -204,11 +204,11 @@ For new development, create a short-lived branch, open a PR, pass tests, and mer
 
 Never commit `登录配置.private.json`, downloaded papers, manifests containing personal paths, or browser data. `.gitignore` does not remove already tracked files. Use the allowlist exporter and inspect its output before publishing. See [SECURITY.md](SECURITY.md).
 
-The project owner still needs to select a license before advertising an open-source license. The presence of public source does not imply that this project is an official university service.
+The software is distributed under the MIT license (see LICENSE); third-party papers and data retain their own rights. The presence of public source does not imply that this project is an official university service.
 
 ## Validation snapshot
 
-50 Python and 30 Node offline tests pass locally. Language switching, English validation and simulated saving were checked in the local browser. Institutional authentication and live full-text downloads still need validation in the user environment.
+80 Python and 37 Node offline tests pass locally. Language switching, English validation and simulated saving were checked in the local browser. Institutional authentication and live full-text downloads still need validation in the user environment.
 
 ## Feedback
 

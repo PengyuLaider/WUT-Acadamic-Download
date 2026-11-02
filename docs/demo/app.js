@@ -61,7 +61,7 @@
       }
       byId('username').value='';byId('password').value='';byId('password').type='password';
       byId('password-toggle').setAttribute('aria-label','显示密码');byId('password-toggle').setAttribute('aria-pressed','false');byId('eye-slash').hidden=true;
-      applyState(next);feedback(demo?'演示保存完成，未写入任何账号密码。正式使用时，请运行本机配置界面。':'账号配置已保存在本机。下一步请运行登录入口，完成学校认证。');
+      applyState(next);feedback(demo?'演示保存完成，未写入任何账号密码。正式使用时，请运行本机配置界面。':(next.encrypted==='dpapi'?'账号配置已用 Windows DPAPI 加密保存在本机。下一步请运行登录入口，完成学校认证。':'账号配置已保存在本机。下一步请运行登录入口，完成学校认证。'));
       byId('feedback').focus();
     }catch(error){feedback(error.name==='TimeoutError'?'保存超时，请先确认本机服务仍在运行。':error.message||'连接失败，请确认本机服务仍在运行。',true);}
     finally{saving=false;byId('save-button').disabled=false;byId('save-label').textContent=state.status==='ready'?'保存配置修改':'保存账号配置';}

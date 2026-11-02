@@ -7,12 +7,12 @@ import shutil
 import zipfile
 
 ROOT=Path(__file__).resolve().parent
-FILES=['VERSION','CHANGELOG.md','README.en.md','README.md','SECURITY.md','.gitignore','.gitattributes','requirements-dev.txt','campus_portal.py','登录配置界面.py','填写登录配置.ps1','登录图书馆.ps1','检查本地环境.ps1','登录配置.example.json','export_public.py']
+FILES=['VERSION','CHANGELOG.md','README.en.md','README.md','SECURITY.md','LICENSE','.gitignore','.gitattributes','requirements-dev.txt','campus_portal.py','登录配置界面.py','填写登录配置.ps1','登录图书馆.ps1','检查本地环境.ps1','登录配置.example.json','export_public.py']
 TREES=['ui','docs','skill-src','.github']
 
 def allowed(path):
     parts=path.parts
-    return not any(p in ('__pycache__','papers','browser-profile','.git','qa') or p.startswith('备份_') for p in parts) and not any(x in path.name for x in ('.private.','.pyc','.tmp','cred.xml')) and path.as_posix()!='skill-src/config/config.json'
+    return not any(p in ('__pycache__','papers','browser-profile','.git','qa') or p.startswith('备份_') for p in parts) and not any(x in path.name for x in ('.private.','.pyc','.tmp','cred.xml','.dpapi','.jsonl','.log','.pdf','.zip','.bundle','.env')) and path.as_posix()!='skill-src/config/config.json'
 
 def export(destination):
     destination=Path(destination).resolve()
@@ -23,12 +23,12 @@ def export(destination):
     destination.mkdir(parents=True)
     manifest=[]
     for source in sources:
-        if source.is_symlink(): raise ValueError('发布源不允许符号链接')
+        if source.is_symlink() or not source.resolve().is_relative_to(ROOT.resolve()): raise ValueError('发布源不允许符号链接')
         relative=source.relative_to(ROOT)
         if not allowed(relative): raise ValueError('发布清单包含禁止文件')
         target=destination/relative;target.parent.mkdir(parents=True,exist_ok=True)
         if source.suffix=='.md':
-            text=source.read_text(encoding='utf-8').replace('C:\\Users\\40635','%USERPROFILE%')
+            text=source.read_text(encoding='utf-8')
             target.write_text(text,encoding='utf-8')
         else: shutil.copyfile(source,target)
         manifest.append({'path':relative.as_posix(),'sha256':hashlib.sha256(target.read_bytes()).hexdigest()})

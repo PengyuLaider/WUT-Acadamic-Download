@@ -6,7 +6,7 @@
 
 ![从校园资源接入，到论文核验归档](docs/images/project-overview.svg)
 
-[下载 v2.0.0](https://github.com/PengyuLaider/WUT-Acadamic-Download/releases/tag/v2.0.0) · [快速开始](#快速开始) · [核心能力](#核心能力) · [输出与状态](#最后会得到什么) · [常见问题](#常见问题)
+[下载 v2.1.0](https://github.com/PengyuLaider/WUT-Acadamic-Download/releases/tag/v2.1.0) · [快速开始](#快速开始) · [核心能力](#核心能力) · [输出与状态](#最后会得到什么) · [常见问题](#常见问题)
 
 ![Offline checks](https://github.com/PengyuLaider/WUT-Acadamic-Download/actions/workflows/test.yml/badge.svg?branch=main)
 
@@ -94,7 +94,7 @@ Python 3.10+。配置界面只用标准库，无需 npm、pip 或前端构建。
 python campus_portal.py
 ```
 
-浏览器打开本机页面，在界面填写校园账号和密码后保存。正式模式将凭据以**明文**保存在本机 `登录配置.private.json`；页面不返回已保存的值，留空可以保留原配置。终端保持前台运行，按 Ctrl+C 停止。不要关闭安全软件、恢复被隔离的旧启动脚本或为本工具添加白名单。
+浏览器打开本机页面，在界面填写校园账号和密码后保存。Windows 正式模式默认通过 DPAPI 加密保存为本机 `登录配置.private.dpapi`；页面不返回已保存的值，留空可以保留原配置。终端保持前台运行，按 Ctrl+C 停止。不要关闭安全软件、恢复被隔离的旧启动脚本或为本工具添加白名单。
 
 仅展示界面、不要读取或保存真实账号时：
 
@@ -195,22 +195,22 @@ OA 获取和本地核验不依赖特定学校。学校入口、认证允许域�
 | 版本 | 定位 | 内容 |
 |---|---|---|
 | v1.0.0 | 历史兼容版本 | 保留初始 main 的命令行实现，不覆盖旧代码 |
-| v2.0.0 | 新用户推荐 | 本机门户、中英文切换、配置反馈、核验与离线测试 |
+| v2.1.0 | 新用户推荐 | 本机门户、中英文切换、配置反馈、核验与离线测试 |
 | main | 持续维护主线 | 集成通过测试的新功能，供默认浏览与下载 |
 
-v1.0.0 固定到原始提交 `3c1df54`，旧版源码单独归档；附带归档不打包论文。Git 历史保持原样。v2.0.0 维护当前门户与完整流程。
+v1.0.0 固定到原始提交 `3c1df54`，旧版源码单独归档；附带归档不打包论文。Git 历史保持原样。v2.1.0 维护当前门户与完整流程。
 
 ## 版本与分支
 
 - `main`：默认分支，保留最新可用源码，普通使用者从这里下载。
 - 功能分支：暂存开发中的改动，通过 Pull Request 合并回 `main`。
-- Releases：用 `v2.0.0` 等标签固定可下载版本；更新记录见 [CHANGELOG.md](CHANGELOG.md)。
+- Releases：用 `v2.1.0` 等标签固定可下载版本；更新记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 每次更新沿用“功能分支 → Pull Request → 测试通过 → 合并 main → 发布版本”，不用为每个版本长期保留一条分支。已合并分支可按需要归档或删除；历史提交可追溯。
 
 发布版本时同步修改 `VERSION` 与 `CHANGELOG.md`。合并到 `main` 后，自动测试通过才会按版本号创建 Release，并附上排除本机数据的源码 ZIP；已有版本不会覆盖。
 
-`main` 的文档可能比已发布 ZIP 更新，已有 Release 不覆盖。固定版本请前往 [v2.0.0](https://github.com/PengyuLaider/WUT-Acadamic-Download/releases/tag/v2.0.0) 或 [v1.0.0](https://github.com/PengyuLaider/WUT-Acadamic-Download/releases/tag/v1.0.0)。
+`main` 的文档可能比已发布 ZIP 更新，已有 Release 不覆盖。固定版本请前往 [v2.1.0](https://github.com/PengyuLaider/WUT-Acadamic-Download/releases/tag/v2.1.0) 或 [v1.0.0](https://github.com/PengyuLaider/WUT-Acadamic-Download/releases/tag/v1.0.0)。
 
 ## 界面预览
 
@@ -244,7 +244,7 @@ python export_public.py --out GitHub发布包/campus-library-papers
 
 导出文件包含源码、空白配置示例、截图、静态演示和测试；排除真实账号文件、用户配置、论文、清单、浏览器数据、备份与缓存，并生成文件哈希清单及 ZIP。
 
-`.gitignore` 无法移除已经跟踪过的敏感文件。不要提交 `登录配置.private.json`；不要上传学校订阅论文。发布前由仓库所有者确定许可证；本项目尚未声明开源许可证。
+`.gitignore` 无法移除已经跟踪过的敏感文件。不要提交 `登录配置.private.json`；不要上传学校订阅论文。发布前由仓库所有者确定许可证；本项目尚采用 MIT 许可证。
 
 ## 目录
 
@@ -265,4 +265,10 @@ export_public.py             公开发布包导出
 
 问题反馈请附系统、Python / Node 版本、执行步骤与脱敏错误信息，通过 [Issues](https://github.com/PengyuLaider/WUT-Acadamic-Download/issues) 提交。不要附真实账号文件、Cookie、浏览器 profile 或订阅论文。
 
-本项目为独立工具，非学校官方服务。当前仓库尚未声明开源许可证；公开可见不等于已经授予任意使用许可。数据处理见 [SECURITY.md](SECURITY.md)。
+本项目为独立工具，非学校官方服务。当前仓库尚采用 MIT 许可证；授权范围见 LICENSE，论文与第三方数据不在软件授权范围内。数据处理见 [SECURITY.md](SECURITY.md)。
+
+## v2.1.0 更新
+
+整合现场改进：Windows DPAPI 默认加密、并发批处理与逐域限速、中文 DOI 解析路径、结构化续接状态、稿件版本与来源类型。进一步修复了配图点击、DOI 单独命中误判成功、单页预览、无效续跑条目与加密失败回退明文问题。加密失败停止保存；可疑文件隔离保留；代理冲突不自动关闭会话。独立安装需显式凭据路径。
+
+`batch --workers 3 --resume`；`import-file --name "文件名" --version-type published --source-type publisher`。0 成功、1 错误、2 需本人或来源不可用、3 待核验或部分完成，以 JSON status 为准。更新与验收边界见 [v2.1 说明](docs/releases/v2.1.0.md)。

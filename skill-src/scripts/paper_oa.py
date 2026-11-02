@@ -9,16 +9,37 @@
 - 下载的 PDF 先校验 %PDF 魔数，再落到 papers/ 目录，并写 manifest.jsonl 去重。
 
 子命令：
-  search   "关键词或标题"                 检索候选论文（OpenAlex/Crossref/S2/arXiv）
-  oa       <DOI|arxiv:ID|pmid:ID|PMCID>    解析 OA 全文位置（不下载）
-  fetch    <DOI|arxiv:ID|pmid:ID|URL>      下载最佳 OA PDF 到 papers/，写清单
-  batch    <文件，每行一个 DOI/标识>        批量 fetch
-  organize <目录>                          重建 manifest.jsonl 对应的 index.csv
+  search      "关键词或标题"               检索候选论文（OpenAlex/Crossref/S2/arXiv）
+  oa          <DOI|arxiv:ID|pmid:ID|PMCID> 解析 OA 全文位置（不下载）
+  fetch       <DOI|arxiv:ID|pmid:ID|URL>   下载最佳 OA PDF 到 papers/，写清单
+  batch       <文件，每行一个 DOI/标识>     批量 fetch（并发 + 断点续跑 + 状态文件）
+  organize    <目录>                       重建 manifest.jsonl 对应的 index.csv
+  import-file <本地 PDF>                   核验并登记浏览器/人工已下载的 PDF（不联网，默认单行 JSON）
 
-常用（所有命令默认输出 JSON，无 --json 参数）：
+中文 DOI：10.16383/、10.19721/、10.15918/、10.3969/ 等前缀的 DOI 不被
+Crossref/OpenAlex/Semantic Scholar 收录，工具改走 chndoi.org 多重解析 -> doi.org 回退，
+再从落地页提取 PDF/全文链接；解析失败报 source_unavailable（不是 no_oa），不伪造官网 URL。
+
+常用（所有命令默认输出 JSON）：
   python paper_oa.py search "graph neural network drug discovery" --limit 8
   python paper_oa.py fetch 10.1038/nature12373
-  python paper_oa.py batch dois.txt --out papers/2025-综述
+  python paper_oa.py batch dois.txt --out papers/2025-综述 --workers 3 --resume
+  python paper_oa.py import-file 已下载.pdf --doi 10.16383/j.aas.c220001 \
+      --title "题名" --name "自动化学报_2024" --version-type published --source-type publisher
+
+退出码（所有子命令统一，脚本化请按此判断）：
+  0  成功/已保存：检索完成、OA 位置解析成功、PDF 已下载并核验（downloaded / exists / ok）
+  1  参数或配置错误：命令行参数非法、配置缺失或无效、标识符无法识别（invalid_identifier），
+     以及致命错误（输入文件不可读、断点文件不可写等）
+  2  需要用户/没有合法 OA：no_oa、source_unavailable（元数据源不可用，不能断言没有 OA）、
+     organize 找不到清单
+  3  部分完成/待核验/下载失败：saved_pending_verification、download_failed、batch 存在未完成项
+
+batch 断点文件（--state，默认 <out>/batch-state.jsonl）每行一条 JSON：
+  {"identifier": ..., "status": ..., "path": ..., "error": ..., "timestamp": ...}
+  --resume 跳过状态为 downloaded / exists / saved_pending_verification 的条目；
+  --workers N（默认 3，1=串行）用 concurrent.futures 并发，manifest 追加加锁，
+  同一 host 的请求起始时间由全局锁保证最小间隔（config.request_interval_seconds）。
 """
 from __future__ import annotations
 
@@ -32,10 +53,12 @@ import os
 import math
 import re
 import sys
+import threading
 import time
 import unicodedata
 import shutil
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib import error, parse, request
@@ -60,6 +83,51 @@ DEFAULT_CONFIG = {
     "sources": ["openalex", "crossref", "semanticscholar", "arxiv"],
     "user_agent": DEFAULT_USER_AGENT,
 }
+
+# 中文 DOI 前缀：这些注册机构的 DOI 一般不在 Crossref/OpenAlex/S2 收录，
+# 需要走 chndoi.org 多重解析或期刊官网。可通过 config.chinese_doi_prefixes 扩展/覆盖。
+CHINESE_DOI_PREFIXES = ("10.16383", "10.19721", "10.15918", "10.3969")
+
+# ---------------------------------------------------------------------------
+# 统一 CLI 退出码（见模块 docstring）
+# ---------------------------------------------------------------------------
+EXIT_OK = 0            # 成功/已保存
+EXIT_USAGE = 1         # 参数或配置错误 / 致命错误
+EXIT_UNAVAILABLE = 2   # 需要用户 / 无合法 OA（no_oa / source_unavailable）
+EXIT_PARTIAL = 3       # 部分完成 / 待核验 / 下载失败
+
+_STATUS_EXIT = {
+    "ok": EXIT_OK,
+    "downloaded": EXIT_OK,
+    "exists": EXIT_OK,
+    "no_oa": EXIT_UNAVAILABLE,
+    "source_unavailable": EXIT_UNAVAILABLE,
+    "empty": EXIT_UNAVAILABLE,
+    "partial": EXIT_PARTIAL,
+    "saved_pending_verification": EXIT_PARTIAL,
+    "download_failed": EXIT_PARTIAL,
+    "error": EXIT_PARTIAL,
+    "missing_files": EXIT_PARTIAL,
+    "invalid_identifier": EXIT_USAGE,
+    "invalid_argument": EXIT_USAGE,
+    "config_error": EXIT_USAGE,
+    "invalid_pdf": EXIT_USAGE,
+}
+
+
+def exit_code_for(status: str) -> int:
+    """把结果状态映射为统一退出码（未知状态按「下载失败」处理）。"""
+    return _STATUS_EXIT.get(str(status or "").strip().lower(), EXIT_PARTIAL)
+
+
+# batch --resume 认为「已完成、可跳过」的状态
+BATCH_DONE_STATUSES = ("downloaded", "exists", "saved_pending_verification")
+BATCH_DEFAULT_WORKERS = 3
+
+# 并发 batch 的线程安全：请求限速 / manifest+state 追加 / stderr 进度
+_RATE_LOCK = threading.Lock()
+_APPEND_LOCK = threading.Lock()
+_STDERR_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +185,32 @@ def ua(cfg: dict) -> str:
     return (cfg.get("user_agent") or DEFAULT_USER_AGENT).format(email=email)
 
 
+def request_interval(host: str, cfg: dict) -> float:
+    """同一 host 两次请求之间的最小间隔（arXiv 强制 >= 3s）。"""
+    host = (host or "").lower()
+    interval = float(cfg.get("request_interval_seconds", 1) or 0)
+    if host == "arxiv.org" or host.endswith(".arxiv.org"):
+        interval = max(interval, 3.0)
+    return max(interval, 0.0)
+
+
+def pace_request(cfg: dict, host: str) -> None:
+    """线程安全地串行化同一 host 的请求起始时间，保证最小间隔（礼貌限速）。
+
+    并发 batch 时多个 worker 共用同一个锁与 ``cfg['_last_request_at']``，
+    因此对同一出版社/API 的连续请求不会挤在一起（P2-5）。
+    """
+    interval = request_interval(host, cfg)
+    with _RATE_LOCK:
+        last = cfg.setdefault("_last_request_at", {})
+        now = time.monotonic()
+        remaining = interval - (now - last.get(host, -float("inf")))
+        if remaining > 0:
+            time.sleep(remaining)
+            now = time.monotonic()
+        last[host] = now
+
+
 def http_get(
     url: str,
     cfg: dict,
@@ -131,14 +225,7 @@ def http_get(
     headers = {"User-Agent": ua(cfg), "Accept": accept}
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
-        host = (parse.urlsplit(url).hostname or "").lower()
-        interval = max(float(cfg.get("request_interval_seconds", 1)),
-                       3.0 if host == "arxiv.org" or host.endswith(".arxiv.org") else 0)
-        last = cfg.setdefault("_last_request_at", {})
-        remaining = interval - (time.monotonic() - last.get(host, -float("inf")))
-        if remaining > 0:
-            time.sleep(remaining)
-        last[host] = time.monotonic()
+        pace_request(cfg, (parse.urlsplit(url).hostname or "").lower())
         req = request.Request(url, headers=headers, method="GET")
         try:
             if not allow_redirects:
@@ -266,6 +353,49 @@ def safe_filename(text: str, maxlen: int = 80) -> str:
     text = re.sub(r"[\\/:*?\"<>|\r\n\t]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip(" .")
     return text[:maxlen].strip(" .") or "untitled"
+
+
+def doi_slug(doi: str, maxlen: int = 70) -> str:
+    """DOI -> 安全文件名片段，例如 10.1234/example(2025) -> 10.1234_example_2025。"""
+    slug = re.sub(r"[^0-9A-Za-z._-]+", "_", (doi or "").strip()).strip("._-")
+    return slug[:maxlen].strip("._-")
+
+
+def split_authors(value) -> list[str]:
+    """--authors 参数：支持 ``;``/``,``/``、`` 分隔，也接受列表。"""
+    if isinstance(value, (list, tuple)):
+        raw = [str(item) for item in value]
+    else:
+        raw = re.split(r"\s*[;；,，、]\s*", str(value or ""))
+    return [author for author in (clean_text(item) for item in raw) if author][:20]
+
+
+def is_chinese_doi(doi: str | None, cfg: dict | None = None) -> bool:
+    """判断是否为中文 DOI 注册机构（chndoi.org）前缀。"""
+    value = normalize_doi(doi or "") or ""
+    if not value:
+        return False
+    prefixes = CHINESE_DOI_PREFIXES
+    if cfg is not None:
+        extra = cfg.get("chinese_doi_prefixes")
+        if isinstance(extra, list) and extra:
+            prefixes = tuple(str(prefix) for prefix in extra)
+    low = value.lower()
+    return any(low == prefix.lower() or low.startswith(prefix.lower() + "/")
+               for prefix in prefixes)
+
+
+CHINESE_DOI_HINTS = [
+    "中文 DOI（10.16383/、10.19721/、10.15918/、10.3969/ 等）通常不被 Crossref/OpenAlex/"
+    "Semantic Scholar 收录，本工具对这类 DOI 直接走 chndoi.org 多重解析，失败再回退 doi.org。",
+    "自动化学报、机械工程学报、中国公路学报、北京理工大学学报等期刊官网多数提供免费 PDF："
+    "在官网按题名检索确认落地页后人工下载，再用 import-file 登记。",
+    "解析失败时不要伪造期刊官网 URL：请用题名+作者检索确认，或在校内网络下人工下载全文。",
+]
+
+
+def chinese_doi_hints() -> list[str]:
+    return list(CHINESE_DOI_HINTS)
 
 
 def file_sha256(path: Path) -> str:
@@ -683,11 +813,129 @@ def arxiv_meta(arxiv_id: str, cfg: dict) -> dict:
     }
 
 
+def _chinese_doi_locations(landing_url: str, html_text: str, source_label: str) -> list[dict]:
+    """把落地页本身与页面里提取到的 PDF/全文链接转成 OA/机构访问位置。"""
+    locations: list[dict] = []
+    if landing_url:
+        locations.append({
+            "pdf": None, "url": landing_url, "source": source_label,
+            "host": (parse.urlsplit(landing_url).hostname or "").lower(),
+            "version": "published", "license": None, "is_best": True,
+        })
+    meta_pdfs: list[str] = []
+    fulltext_links: list[str] = []
+    if html_text:
+        meta_pdfs = extract_pdf_url_from_html(html_text, landing_url)
+        fulltext_links = extract_fulltext_links(html_text, landing_url)
+    seen: set[str] = set()
+    for url in meta_pdfs + fulltext_links:
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        # citation_pdf_url 明确声明是 PDF；普通链接按 URL 形态判断
+        is_pdf = url in meta_pdfs or _looks_like_pdf_url(url)
+        locations.append({
+            "pdf": url if is_pdf else None, "url": url, "source": source_label,
+            "host": (parse.urlsplit(url).hostname or "").lower(),
+            "version": "published" if is_pdf else "unknown",
+            "license": None, "is_best": is_pdf,
+        })
+    return dedupe_locations(locations)
+
+
+def resolve_chinese_doi(doi: str, cfg: dict) -> dict:
+    """中文 DOI 专门解析路径。
+
+    1) 先请求 ``https://www.chndoi.org/Resolution/Handler?doi=<urlencode>`` 并跟随重定向拿落地页；
+    2) 拿不到落地页时 fallback ``https://doi.org/<doi>``；
+    3) 从落地页 HTML 通用提取 PDF/全文链接（过滤图片/静态资源）；
+    4) 解析失败只如实报告 ``source_unavailable`` + 中文提示，绝不伪造期刊官网 URL。
+
+    返回 ``{status, doi, chinese_doi, landing_url, locations, source_errors, hints}``。
+    """
+    result: dict = {
+        "status": "source_unavailable",
+        "doi": doi,
+        "chinese_doi": True,
+        "landing_url": None,
+        "locations": [],
+        "source_errors": [],
+        "hints": chinese_doi_hints(),
+    }
+    source_label = "chndoi"
+    landing: str | None = None
+    html_text = ""
+    encoded = parse.quote(doi, safe="")
+    chndoi_url = "https://www.chndoi.org/Resolution/Handler?" + parse.urlencode({"doi": doi})
+    accept = "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"
+
+    # 1) chndoi.org 多重解析（跟随重定向拿落地页）
+    try:
+        res = http_get(chndoi_url, cfg, accept=accept)
+    except RuntimeError as exc:
+        result["source_errors"].append(
+            {"source": "chndoi", "reason": "network_error", "detail": str(exc)})
+        res = None
+    if res is not None:
+        final_url = res.get("url") or chndoi_url
+        html_text = _decode_html(res.get("body") or b"")
+        if res.get("status") == 200 and _is_external_landing(final_url):
+            landing = final_url
+        elif res.get("status") == 200:
+            refresh = extract_meta_refresh_url(html_text, final_url)
+            if refresh and _is_external_landing(refresh):
+                landing = refresh
+        elif res.get("status") not in (301, 302, 303, 307, 308):
+            result["source_errors"].append({"source": "chndoi", "status": res.get("status")})
+
+    # 2) doi.org 兜底（chndoi 超时/无落地页/中间页跳转失败）
+    if not landing:
+        doi_url = "https://doi.org/" + encoded
+        try:
+            res2 = http_get(doi_url, cfg, accept=accept)
+        except RuntimeError as exc:
+            result["source_errors"].append(
+                {"source": "doi-resolver", "reason": "network_error", "detail": str(exc)})
+        else:
+            final_url = res2.get("url") or doi_url
+            body = res2.get("body") or b""
+            html2 = _decode_html(body) if body else ""
+            if res2.get("status") == 200 and _is_external_landing(final_url):
+                landing = final_url
+                source_label = "doi-resolver"
+                html_text = html2 or html_text
+            elif res2.get("status") == 200:
+                refresh = extract_meta_refresh_url(html2, final_url)
+                if refresh and _is_external_landing(refresh):
+                    landing = refresh
+                    source_label = "doi-resolver"
+                    html_text = html2
+            elif res2.get("status") not in (301, 302, 303, 307, 308):
+                result["source_errors"].append(
+                    {"source": "doi-resolver", "status": res2.get("status")})
+
+    if not landing:
+        # 解析失败：明确报 source_unavailable（而不是 no_oa），并给出中文 DOI 提示
+        result["source_errors"].append({"source": "chndoi", "reason": "source_unavailable"})
+        return result
+
+    locations = _chinese_doi_locations(landing, html_text, source_label)
+    result["landing_url"] = landing
+    result["locations"] = locations
+    result["status"] = "ok"
+    if not any(loc.get("pdf") or _looks_like_pdf_url(loc.get("url") or "")
+               for loc in locations):
+        # 只找到落地页、没找到 PDF/全文链接：如实记录，让调用方人工确认，不猜测 URL
+        result["source_errors"].append({"source": source_label, "reason": "no_pdf_link"})
+    return result
+
+
 def resolve_oa(identifier: str, cfg: dict) -> dict:
-    """解析标识符 -> {kind, id, metadata, locations}。"""
+    """解析标识符 -> {kind, id, metadata, locations, hints?}。"""
     kind, value = classify_identifier(identifier)
     locations: list[dict] = []
     metadata: dict = {}
+    hints: list[str] = []
     doi = value if kind == "doi" else None
     arxiv_id = value if kind == "arxiv" else None
     pmid = value if kind == "pmid" else None
@@ -704,37 +952,48 @@ def resolve_oa(identifier: str, cfg: dict) -> dict:
         arxiv_doi = ARXIV_DOI_RE.match(doi)
         if arxiv_doi and not arxiv_id:
             arxiv_id = arxiv_doi.group(1)
-        # arXiv DOI 不属于 Crossref 体系，Unpaywall 会返回 422，直接跳过
-        if not arxiv_doi:
-            locations += unpaywall_locations(doi, cfg)
-        locations += arxiv_locations(doi, arxiv_id, cfg)
-        work = openalex_work(doi, cfg)
-        if work:
-            locations += openalex_locations(work)
-            metadata = merge_metadata(metadata, work_to_meta(work))
-        s2 = s2_by_doi(doi, cfg)
-        if s2:
-            pdf = (s2.get("openAccessPdf") or {}).get("url")
-            if pdf:
-                locations.append({"pdf": pdf, "url": pdf, "source": "semanticscholar",
-                                  "host": None, "version": None, "license": None, "is_best": False})
-            metadata = merge_metadata(metadata, s2_to_meta(s2))
-            external = s2.get("externalIds") or {}
-            if not arxiv_id and external.get("ArXiv"):
-                arxiv_id = external["ArXiv"]
-            if not pmid and external.get("PubMed"):
-                pmid = str(external["PubMed"])
-            if not pmcid and external.get("PubMedCentral"):
-                pmcid = "PMC" + str(external["PubMedCentral"])
-        locations += arxiv_locations(doi, arxiv_id, cfg)
-        if pmid or pmcid:
-            locations += europepmc_locations(doi, pmid, pmcid, cfg)
-        if not metadata.get("title"):
-            meta = crossref_meta(doi, cfg)
-            if meta:
-                metadata = merge_metadata(metadata, crossref_to_meta(meta))
-        if not metadata.get("title") and arxiv_id:
-            metadata = merge_metadata(metadata, arxiv_meta(arxiv_id, cfg))
+        if is_chinese_doi(doi, cfg):
+            # 中文 DOI 不在 Crossref/OpenAlex/S2 收录范围：走 chndoi 专用路径，
+            # 跳过多源查询（避免每篇 3 次无谓 404 请求与误判 no_oa）。
+            chinese = resolve_chinese_doi(doi, cfg)
+            locations += chinese.get("locations") or []
+            for item in chinese.get("source_errors") or []:
+                cfg.setdefault("_source_errors", []).append(item)
+            hints += chinese.get("hints") or chinese_doi_hints()
+            if not metadata.get("doi"):
+                metadata = merge_metadata(metadata, {"doi": doi})
+        else:
+            # arXiv DOI 不属于 Crossref 体系，Unpaywall 会返回 422，直接跳过
+            if not arxiv_doi:
+                locations += unpaywall_locations(doi, cfg)
+            locations += arxiv_locations(doi, arxiv_id, cfg)
+            work = openalex_work(doi, cfg)
+            if work:
+                locations += openalex_locations(work)
+                metadata = merge_metadata(metadata, work_to_meta(work))
+            s2 = s2_by_doi(doi, cfg)
+            if s2:
+                pdf = (s2.get("openAccessPdf") or {}).get("url")
+                if pdf:
+                    locations.append({"pdf": pdf, "url": pdf, "source": "semanticscholar",
+                                      "host": None, "version": None, "license": None, "is_best": False})
+                metadata = merge_metadata(metadata, s2_to_meta(s2))
+                external = s2.get("externalIds") or {}
+                if not arxiv_id and external.get("ArXiv"):
+                    arxiv_id = external["ArXiv"]
+                if not pmid and external.get("PubMed"):
+                    pmid = str(external["PubMed"])
+                if not pmcid and external.get("PubMedCentral"):
+                    pmcid = "PMC" + str(external["PubMedCentral"])
+            locations += arxiv_locations(doi, arxiv_id, cfg)
+            if pmid or pmcid:
+                locations += europepmc_locations(doi, pmid, pmcid, cfg)
+            if not metadata.get("title"):
+                meta = crossref_meta(doi, cfg)
+                if meta:
+                    metadata = merge_metadata(metadata, crossref_to_meta(meta))
+            if not metadata.get("title") and arxiv_id:
+                metadata = merge_metadata(metadata, arxiv_meta(arxiv_id, cfg))
     elif arxiv_id:
         locations += arxiv_locations(None, arxiv_id, cfg)
         metadata = merge_metadata({"title": "", "authors": [], "year": None,
@@ -747,7 +1006,11 @@ def resolve_oa(identifier: str, cfg: dict) -> dict:
                             "doi": None}
                 break
 
-    return {"kind": kind, "id": value, "metadata": metadata, "locations": dedupe_locations(locations)}
+    result = {"kind": kind, "id": value, "metadata": metadata,
+              "locations": dedupe_locations(locations)}
+    if hints:
+        result["hints"] = hints
+    return result
 
 
 def dedupe_locations(locations: list[dict]) -> list[dict]:
@@ -825,6 +1088,97 @@ def extract_pdf_url_from_html(html: str, page_url: str) -> list[str]:
     return candidates[:5]
 
 
+_LINK_ANCHOR_RE = re.compile(r"<a\b[^>]*?href\s*=\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", re.I | re.S)
+_STATIC_ASSET_RE = re.compile(
+    r"\.(?:png|jpe?g|gif|svg|webp|bmp|ico|css|js|map|woff2?|ttf|otf|eot|mp4|mp3|zip|rar|7z"
+    r"|xml|json|txt|csv)(?:$|[?#])",
+    re.I,
+)
+_FULLTEXT_TEXT_RE = re.compile(r"(pdf|full[\s_-]?text|download|全文|下载|原文|正文)", re.I)
+
+
+def _looks_like_pdf_url(url: str) -> bool:
+    """URL 是否像 PDF（.pdf 结尾，或期刊常见的 /pdf 路径段、?pdf=render）。"""
+    low = (url or "").lower()
+    return ".pdf" in low or "pdf=render" in low or bool(re.search(r"/pdf(?:[/?#]|$)", low))
+
+
+def _decode_html(body: bytes) -> str:
+    """按 <meta charset> 解码落地页 HTML，失败回退 utf-8/replace。"""
+    text = (body or b"").decode("utf-8", "replace")
+    match = re.search(r"<meta[^>]+charset\s*=\s*[\"']?([\w-]+)", text[:4096], re.I)
+    if match:
+        try:
+            return (body or b"").decode(match.group(1), "replace")
+        except LookupError:
+            return text
+    return text
+
+
+def extract_fulltext_links(html_text: str, page_url: str) -> list[str]:
+    """从落地页 HTML 提取 PDF/全文链接（通用提取，匹配不到就返回空，绝不适造 URL）。
+
+    只接受 http(s) 链接，过滤图片/静态资源，优先 .pdf。
+    """
+    if not html_text:
+        return []
+    candidates: list[str] = []
+    for match in _LINK_ANCHOR_RE.finditer(html_text):
+        raw_href = html_lib.unescape(match.group(1) or "").strip()
+        if not raw_href or raw_href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            continue
+        absolute = parse.urljoin(page_url, raw_href)
+        parts = parse.urlsplit(absolute)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            continue
+        if _STATIC_ASSET_RE.search(parts.path) or _STATIC_ASSET_RE.search(parts.query or ""):
+            continue
+        anchor_text = clean_text(re.sub(r"<[^>]+>", " ", match.group(2) or ""))
+        href_low = absolute.lower()
+        looks_like_fulltext = (
+            ".pdf" in href_low
+            or "download" in href_low
+            or "fulltext" in href_low
+            or "pdf" in anchor_text.lower()
+            or bool(_FULLTEXT_TEXT_RE.search(anchor_text))
+        )
+        if not looks_like_fulltext or absolute in candidates:
+            continue
+        candidates.append(absolute)
+    candidates.sort(key=lambda url: 0 if _looks_like_pdf_url(url) else 1)
+    return candidates[:5]
+
+
+def extract_meta_refresh_url(html_text: str, page_url: str) -> str | None:
+    """提取 <meta http-equiv="refresh"> 跳转目标（chndoi.org 中间页常见）。"""
+    if not html_text:
+        return None
+    match = re.search(
+        r"<meta[^>]+http-equiv\s*=\s*[\"']?refresh[\"']?[^>]*content\s*=\s*[\"']([^\"']+)[\"']",
+        html_text, re.I,
+    )
+    if not match:
+        return None
+    target = re.search(r"url\s*=\s*(.+)$", html_lib.unescape(match.group(1)), re.I)
+    if not target:
+        return None
+    absolute = parse.urljoin(page_url, target.group(1).strip().strip("'\""))
+    parts = parse.urlsplit(absolute)
+    return absolute if parts.scheme in ("http", "https") and parts.netloc else None
+
+
+def _is_external_landing(url: str) -> bool:
+    """判断重定向终点是否为出版社/期刊落地页（排除 doi.org / chndoi.org 自身）。"""
+    host = (parse.urlsplit(url or "").hostname or "").lower()
+    if not host:
+        return False
+    if host == "chndoi.org" or host.endswith(".chndoi.org"):
+        return False
+    if host in ("doi.org", "dx.doi.org", "www.doi.org"):
+        return False
+    return True
+
+
 def looks_like_pdf(body: bytes) -> bool:
     return body.startswith(b"%PDF-") and b"%%EOF" in body[-4096:]
 
@@ -859,18 +1213,35 @@ def try_download_pdf(url: str, cfg: dict) -> dict:
 
 
 def build_pdf_name(metadata: dict, identifier: str) -> str:
-    year = metadata.get("year") or "nd"
+    """归档文件名：year[_surname]_标题.pdf；没有标题时用 DOI_slug，不用 nd_anon 前缀。"""
+    year = metadata.get("year")
     authors = metadata.get("authors") or []
-    surname = safe_filename(authors[0].split()[-1], 24) if authors else "anon"
-    title = metadata.get("title") or identifier
-    return f"{year}_{surname}_{safe_filename(title, 70)}.pdf"
+    title = metadata.get("title") or ""
+    if title:
+        parts: list[str] = []
+        if year:
+            parts.append(str(year))
+        if authors:
+            parts.append(safe_filename(authors[0].split()[-1], 24))
+        parts.append(safe_filename(title, 70))
+        return "_".join(part for part in parts if part) + ".pdf"
+    if normalize_doi(identifier or ""):
+        slug = doi_slug(identifier)
+    else:
+        slug = safe_filename(norm_identifier(identifier) or "paper", 60).replace(" ", "_")
+    return f"{year}_{slug}.pdf" if year else (slug or "paper") + ".pdf"
 
 
 def read_manifest(manifest: Path) -> list[dict]:
     if not manifest.is_file():
         return []
     records = []
-    for line in manifest.read_text(encoding="utf-8").splitlines():
+    with _APPEND_LOCK:  # 与并发 batch 的追加互斥，避免读到半行
+        try:
+            text = manifest.read_text(encoding="utf-8")
+        except OSError:
+            return []
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -881,6 +1252,31 @@ def read_manifest(manifest: Path) -> list[dict]:
         except json.JSONDecodeError:
             continue
     return records
+
+
+def append_jsonl(path: Path, record: dict) -> None:
+    """线程安全地追加一行 JSON（manifest.jsonl / batch-state.jsonl 共用）。"""
+    line = json.dumps(record, ensure_ascii=False)
+    with _APPEND_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+
+
+def open_exclusive_destination(out_dir: Path, filename: str):
+    """独占创建目标文件，重名时自动加 _2/_3 后缀；返回 (path, handle)。
+
+    用 ``open('xb')`` 的 O_EXCL 语义代替 exists() 检查，并发/多进程下不会互相覆盖。
+    """
+    candidate = out_dir / filename
+    stem = Path(filename).stem
+    counter = 2
+    while True:
+        try:
+            return candidate, candidate.open("xb")
+        except FileExistsError:
+            candidate = out_dir / f"{stem}_{counter}.pdf"
+            counter += 1
 
 
 def norm_identifier(value: str) -> str:
@@ -896,7 +1292,6 @@ def norm_identifier(value: str) -> str:
 def record_path(record: dict, manifest: Path) -> Path:
     p = Path(record.get("path") or "__missing__")
     if p.is_absolute():
-        # Normalize aliases before comparing paths or choosing an import destination.
         return p.resolve()
     # Legacy records stored paths relative to the original working directory.
     # Try beside manifest, then its parent, without depending on current cwd.
@@ -910,7 +1305,7 @@ def record_file_valid(record: dict, manifest: Path) -> bool:
     if not record.get("path") or not record.get("sha256"):
         return False
     validation = check_file(record_path(record, manifest), record.get("doi") or "", record.get("title") or "")
-    return validation.get("valid") is True and validation.get("sha256") == record["sha256"]
+    return verified(validation) and validation.get("sha256") == record["sha256"]
 
 
 def find_existing(manifest: Path, doi: str | None, identifier: str | None = None) -> dict | None:
@@ -958,8 +1353,9 @@ def fetch_one(identifier: str, cfg: dict, out_dir: Path, *, force: bool = False)
                     "title": existing.get("title") or metadata.get("title"), "record": existing}
 
     locations = resolved.get("locations") or []
+    hints = list(resolved.get("hints") or [])
     if not locations:
-        return {
+        payload = {
             "status": "source_unavailable" if cfg.get("_source_errors") else "no_oa",
             "source_errors": list(cfg.get("_source_errors", [])),
             "identifier": identifier,
@@ -973,6 +1369,9 @@ def fetch_one(identifier: str, cfg: dict, out_dir: Path, *, force: bool = False)
                 "给通讯作者发邮件索取（可在 open-access.md 找模板）",
             ],
         }
+        if hints:
+            payload["hints"] = hints
+        return payload
 
     errors = []
     attempted = set()
@@ -1006,13 +1405,8 @@ def fetch_one(identifier: str, cfg: dict, out_dir: Path, *, force: bool = False)
                             "record": old,
                         }
             filename = build_pdf_name(metadata, resolved["id"])
-            destination = out_dir / filename
-            counter = 2
-            while destination.exists():
-                destination = out_dir / f"{Path(filename).stem}_{counter}.pdf"
-                counter += 1
-            # Exclusive creation avoids overwriting another process's completed file.
-            with destination.open("xb") as handle:
+            destination, handle = open_exclusive_destination(out_dir, filename)
+            with handle:
                 handle.write(outcome["body"])
             record = {
                 "doi": doi,
@@ -1024,6 +1418,7 @@ def fetch_one(identifier: str, cfg: dict, out_dir: Path, *, force: bool = False)
                 "status": "downloaded" if verified(validation) else "saved_pending_verification",
                 "verification": validation,
                 "source": loc.get("source"),
+                "source_type": "publisher" if loc.get("source") in ("chndoi", "doi-resolver") else "oa",
                 "license": loc.get("license"),
                 "version": loc.get("version"),
                 "url": public_url(outcome.get("url") or ""),
@@ -1032,10 +1427,9 @@ def fetch_one(identifier: str, cfg: dict, out_dir: Path, *, force: bool = False)
                 "sha256": digest,
                 "retrieved_at": now_iso(),
             }
-            with manifest.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            append_jsonl(manifest, record)
             return record
-    return {
+    payload = {
         "status": "download_failed",
         "identifier": identifier,
         "doi": doi,
@@ -1046,16 +1440,27 @@ def fetch_one(identifier: str, cfg: dict, out_dir: Path, *, force: bool = False)
             "校内网络下访问出版社页面人工下载",
         ],
     }
+    if hints:
+        payload["hints"] = hints
+    return payload
 
 
 # ---------------------------------------------------------------------------
 # 命令
 # ---------------------------------------------------------------------------
+def emit_json(payload: dict, pretty: bool = False) -> None:
+    """输出 JSON：默认单行（便于脚本 ``json.loads(stdout)``），--pretty 时多行缩进。"""
+    if pretty:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+
 def cmd_search(args, cfg: dict) -> int:
     results = search(args.query, cfg, args.limit, oa_only=args.oa_only)
     payload = {"status": "ok", "query": args.query, "count": len(results), "results": results}
     print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0
+    return EXIT_OK
 
 
 def cmd_oa(args, cfg: dict) -> int:
@@ -1069,87 +1474,269 @@ def cmd_oa(args, cfg: dict) -> int:
             "examples": ["10.1038/nature12373", "arxiv:1706.03762", "pmid:12345678",
                          "https://arxiv.org/pdf/1706.03762"],
         }, ensure_ascii=False, indent=2))
-        return 2
-    payload = {"status": "ok" if resolved["locations"] else ("source_unavailable" if cfg.get("_source_errors") else "no_oa"), "source_errors": cfg.get("_source_errors", []), **resolved}
+        return EXIT_USAGE
+    payload = {"status": "ok" if resolved["locations"] else ("source_unavailable" if cfg.get("_source_errors") else "no_oa"),
+               "source_errors": cfg.get("_source_errors", []), **resolved}
     print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0 if resolved["locations"] else 2
+    return EXIT_OK if resolved["locations"] else EXIT_UNAVAILABLE
 
 
 def cmd_fetch(args, cfg: dict) -> int:
     out_dir = Path(args.out or cfg.get("download_dir") or "papers").expanduser()
     result = fetch_one(args.identifier, cfg, out_dir, force=args.force)
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return {"downloaded": 0, "exists": 0, "no_oa": 2,
-            "download_failed": 1, "invalid_identifier": 2}.get(result["status"], 1)
+    return exit_code_for(result.get("status") or "error")
+
+
+def load_batch_state(state_path: Path) -> dict[str, dict]:
+    """读取断点文件：归一化 identifier -> 最后一条状态记录。"""
+    state: dict[str, dict] = {}
+    if not state_path.is_file():
+        return state
+    try:
+        lines = state_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        print(f"[warn] 无法读取断点文件 {state_path}: {exc}", file=sys.stderr)
+        return state
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            print(f"[warn] 忽略无法解析的断点记录: {state_path}", file=sys.stderr)
+            continue
+        if isinstance(record, dict) and record.get("identifier"):
+            state[norm_identifier(str(record["identifier"]))] = record
+    return state
+
+
+def batch_state_record(identifier: str, result: dict) -> dict:
+    """断点文件一行：identifier / status / path / error / timestamp。"""
+    error: str | None = str(result["reason"]) if result.get("reason") else None
+    if not error and result.get("errors"):
+        error = "; ".join(str(item.get("reason") if isinstance(item, dict) else item)
+                          for item in result["errors"][:3])
+    if not error and result.get("source_errors"):
+        error = "; ".join(str(item.get("reason") or item.get("status") or item)
+                          for item in result["source_errors"][:3])
+    return {
+        "identifier": public_url(identifier),
+        "doi":result.get("doi"),"title":result.get("title"),"sha256":result.get("sha256"),
+        "status": result.get("status") or "error",
+        "path": result.get("path"),
+        "error": error,
+        "timestamp": now_iso(),
+    }
 
 
 def cmd_batch(args, cfg: dict) -> int:
+    """并发批量 fetch：--workers 并发、--resume 断点续跑、--state 状态文件。"""
     source = Path(args.file)
     if not source.is_file():
         print(json.dumps({"status": "error", "message": f"文件不存在: {source}"}, ensure_ascii=False))
-        return 1
-    identifiers = [
-        line.strip() for line in source.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
+        return EXIT_USAGE
+    workers = getattr(args, "workers", BATCH_DEFAULT_WORKERS)
+    if not isinstance(workers, int) or isinstance(workers, bool) or workers < 1:
+        print(json.dumps({"status": "invalid_argument", "reason": "--workers 必须为 >=1 的整数"},
+                         ensure_ascii=False))
+        return EXIT_USAGE
+    force = bool(getattr(args, "force", False))
+    resume = bool(getattr(args, "resume", False))
+    try:
+        lines = source.read_text(encoding="utf-8-sig").splitlines()
+    except OSError as exc:
+        print(json.dumps({"status": "error", "message": f"无法读取清单 {source}: {exc}"},
+                         ensure_ascii=False))
+        return EXIT_USAGE
+    identifiers = [line.strip() for line in lines
+                   if line.strip() and not line.strip().startswith("#")]
     out_dir = Path(args.out or cfg.get("download_dir") or "papers").expanduser()
-    results = []
-    for index, identifier in enumerate(identifiers, start=1):
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(json.dumps({"status": "error", "message": f"无法创建输出目录 {out_dir}: {exc}"},
+                         ensure_ascii=False))
+        return EXIT_USAGE
+    state_path = Path(getattr(args, "state", None) or (out_dir / "batch-state.jsonl")).expanduser()
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        if state_path.exists() and state_path.is_dir():
+            raise OSError("断点文件路径是目录")
+    except OSError as exc:
+        print(json.dumps({"status": "error", "message": f"断点文件不可用 {state_path}: {exc}"},
+                         ensure_ascii=False))
+        return EXIT_USAGE
+
+    done_state = load_batch_state(state_path) if resume else {}
+    pending: list[tuple[int, str]] = []
+    skipped_items: dict[int, dict] = {}
+    for index, identifier in enumerate(identifiers):
+        entry = done_state.get(norm_identifier(identifier)) if resume else None
+        if entry and not force and str(entry.get("status") or "") in ("downloaded","exists") and record_file_valid(entry,state_path):
+            skipped_items[index] = {
+                "identifier": identifier,
+                "status": "skipped",
+                "previous_status": entry.get("status"),
+                "path": entry.get("path"),
+            }
+            continue
+        pending.append((index, identifier))
+
+    # 并发 worker 共享同一份限速状态（_last_request_at），但 _source_errors 各自隔离
+    cfg.setdefault("_last_request_at", {})
+    results: dict[int, dict] = {}
+    completed = 0
+
+    def run_one(identifier: str) -> dict:
+        worker_cfg = dict(cfg)
         try:
-            result = fetch_one(identifier, cfg, out_dir, force=args.force)
+            return fetch_one(identifier, worker_cfg, out_dir, force=force)
         except (OSError, ValueError, RuntimeError) as exc:
-            result = {"status": "error", "identifier": public_url(identifier), "reason": type(exc).__name__}
-        results.append(result)
-        print(f"[{index}/{len(identifiers)}] {result.get('status')}  {identifier}", file=sys.stderr)
-        if index < len(identifiers):
-            polite_sleep(cfg)
-    complete = all(r.get("status") in ("downloaded", "exists") for r in results)
+            return {"status": "error", "identifier": public_url(identifier),
+                    "reason": type(exc).__name__}
+
+    def record_result(index: int, identifier: str, result: dict) -> None:
+        nonlocal completed
+        results[index] = result
+        try:
+            append_jsonl(state_path, batch_state_record(identifier, result))
+        except OSError as exc:
+            print(f"[warn] 无法写入断点文件 {state_path}: {exc}", file=sys.stderr)
+        with _STDERR_LOCK:
+            completed += 1
+            print(f"[{completed}/{len(pending)}] {result.get('status')}  {identifier}",
+                  file=sys.stderr, flush=True)
+
+    effective_workers = min(workers, max(1, len(pending)))
+    if not pending:
+        print(f"[batch] 无可执行条目（--resume 跳过 {len(skipped_items)} 条）", file=sys.stderr)
+    if effective_workers <= 1 or not pending:
+        for index, identifier in pending:
+            record_result(index, identifier, run_one(identifier))
+    else:
+        with ThreadPoolExecutor(max_workers=effective_workers,
+                                thread_name_prefix="paper-oa") as pool:
+            futures = {pool.submit(run_one, identifier): (index, identifier)
+                       for index, identifier in pending}
+            for future in as_completed(futures):
+                index, identifier = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:  # pragma: no cover - 防御性兜底
+                    result = {"status": "error", "identifier": public_url(identifier),
+                              "reason": type(exc).__name__}
+                record_result(index, identifier, result)
+
+    ordered = [results.get(index) or skipped_items.get(index) or {"status": "error"}
+               for index in range(len(identifiers))]
+    statuses = [str(results[index].get("status") or "error") for index in sorted(results)]
+    downloaded = sum(1 for status in statuses if status == "downloaded")
+    exists = sum(1 for status in statuses if status == "exists")
+    pending_verification = sum(1 for status in statuses if status == "saved_pending_verification")
+    no_oa = sum(1 for status in statuses if status == "no_oa")
+    unavailable = sum(1 for status in statuses if status == "source_unavailable")
+    failed = sum(1 for status in statuses if status not in
+                 ("downloaded", "exists", "saved_pending_verification", "no_oa", "source_unavailable"))
+    incomplete = len(pending) - downloaded - exists
     summary = {
-        "status": "ok" if complete else "partial",
-        "total": len(results),
-        "downloaded": sum(1 for r in results if r.get("status") == "downloaded"),
-        "exists": sum(1 for r in results if r.get("status") == "exists"),
-        "no_oa": sum(1 for r in results if r.get("status") == "no_oa"),
-        "pending_verification": sum(1 for r in results if r.get("status") == "saved_pending_verification"),
-        "failed": sum(1 for r in results if r.get("status") not in ("downloaded", "exists", "saved_pending_verification", "no_oa")), 
-        "results": results,
+        "status": "ok" if incomplete == 0 else "partial",
+        "total": len(identifiers),
+        "downloaded": downloaded,
+        "exists": exists,
+        "no_oa": no_oa,
+        "source_unavailable": unavailable,
+        "pending_verification": pending_verification,
+        "failed": failed,
+        "skipped": len(skipped_items),
+        "incomplete": incomplete,
+        "workers": effective_workers,
+        "state": str(state_path),
+        "results": ordered,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0 if complete else 1
+    return EXIT_OK if incomplete == 0 else EXIT_PARTIAL
+
+
+def import_archive_name(args, source: Path) -> str:
+    """import-file 归档文件名：--name 优先；否则标题 / DOI_slug / paper，绝不用 nd_anon 前缀。"""
+    raw_name = str(getattr(args, "name", "") or "").strip()
+    if raw_name:
+        explicit = safe_filename(raw_name, 80)
+        return explicit if explicit.lower().endswith(".pdf") else explicit + ".pdf"
+    title = clean_text(getattr(args, "title", "") or "")
+    authors = split_authors(getattr(args, "authors", "") or "")
+    year = getattr(args, "year", None)
+    doi = normalize_doi(getattr(args, "doi", "") or "")
+    if title:
+        if year and authors:
+            return (f"{year}_{safe_filename(authors[0].split()[-1], 24)}_"
+                    f"{safe_filename(title, 70)}.pdf")
+        return safe_filename(title, 80) + ".pdf"
+    if doi:
+        return doi_slug(doi) + ".pdf"
+    return "paper.pdf"
 
 
 def cmd_import_file(args, cfg: dict) -> int:
-    """Register a user/browser-downloaded file without contacting any website."""
+    """核验并登记用户/浏览器已下载的 PDF（不联网）。
+
+    默认输出单行 JSON（``--pretty`` 保留多行缩进），便于 ``json.loads(stdout)``。
+    """
+    pretty = bool(getattr(args, "pretty", False))
     source = Path(args.file).expanduser().resolve()
-    validation = check_file(source, args.doi or "", args.title or "", cfg["max_pdf_mb"])
+    doi = normalize_doi(getattr(args, "doi", "") or "") or ""
+    title = clean_text(getattr(args, "title", "") or "")
+    validation = check_file(source, doi, title, cfg["max_pdf_mb"])
     if validation.get("valid") is False:
-        print(json.dumps({"status": "invalid_pdf", "verification": validation}, ensure_ascii=False))
-        return 1
+        emit_json({"status": "invalid_pdf", "file": str(source), "verification": validation}, pretty)
+        return EXIT_USAGE
+    authors = split_authors(getattr(args, "authors", "") or "")
+    year = getattr(args, "year", None)
+    venue = clean_text(getattr(args, "venue", "") or "")
+    version_type = getattr(args, "version_type", None) or "unknown"
+    source_type = getattr(args, "source_type", None) or "local"
     out = Path(args.out or cfg["download_dir"]).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     manifest = out / "manifest.jsonl"
-    existing = next((r for r in reversed(read_manifest(manifest))
-                     if r.get("sha256") == validation["sha256"] and record_file_valid(r, manifest)), None)
-    destination = record_path(existing, manifest) if existing else source
-    if destination.parent != out:
-        name = build_pdf_name({"title": args.title or source.stem}, args.doi or source.stem)
-        destination = out / name
-        count = 2
-        while destination.exists():
-            destination = out / f"{Path(name).stem}_{count}.pdf"
-            count += 1
-        with source.open("rb") as src, destination.open("xb") as dst:
-            shutil.copyfileobj(src, dst)
+    existing = next((record for record in reversed(read_manifest(manifest))
+                     if record.get("sha256") == validation["sha256"]
+                     and record_file_valid(record, manifest)), None)
+    if existing:
+        # 同一文件已登记：复用原路径，不重复复制
+        destination = record_path(existing, manifest)
+    elif source.parent == out and not str(getattr(args, "name", "") or "").strip():
+        destination = source
+    else:
+        destination, handle = open_exclusive_destination(out, import_archive_name(args, source))
+        with handle, source.open("rb") as src:
+            shutil.copyfileobj(src, handle)
     status = "downloaded" if verified(validation) else "saved_pending_verification"
-    record = {"status": status, "identifier": args.doi or public_url(args.source_url or ""),
-              "doi": normalize_doi(args.doi or ""), "title": args.title or "", "authors": [],
-              "year": None, "source": "local-import", "url": public_url(args.source_url or ""),
-              "path": str(destination), "sha256": validation["sha256"], "bytes": validation["bytes"],
-              "verification": validation, "retrieved_at": now_iso(), "license": None, "version": None}
-    with manifest.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-    print(json.dumps(record, ensure_ascii=False, indent=2))
-    return 0 if status == "downloaded" else 3
+    record = {
+        "status": status,
+        "identifier": doi or public_url(getattr(args, "source_url", "") or ""),
+        "doi": doi or None,
+        "title": title,
+        "authors": authors,
+        "year": year,
+        "venue": venue,
+        "source": source_type,
+        "source_type": source_type,
+        "version": version_type,
+        "url": public_url(getattr(args, "source_url", "") or ""),
+        "path": str(destination),
+        "sha256": validation["sha256"],
+        "bytes": validation["bytes"],
+        "verification": validation,
+        "retrieved_at": now_iso(),
+        "license": None,
+    }
+    append_jsonl(manifest, record)
+    payload = dict(record)
+    payload["manifest"] = str(manifest)
+    emit_json(payload, pretty)
+    return EXIT_OK if status == "downloaded" else EXIT_PARTIAL
 
 
 def cmd_organize(args, cfg: dict) -> int:
@@ -1157,13 +1744,13 @@ def cmd_organize(args, cfg: dict) -> int:
     manifest = target / "manifest.jsonl"
     records = read_manifest(manifest)
     # Later verification supersedes earlier pending records of the same local file.
-    records = list({record_path(r, manifest): r for r in records}.values())
+    records = list({str(record_path(r, manifest)): r for r in records}.values())
     if not records:
         print(json.dumps({"status": "empty", "message": f"没有找到 {manifest}"}, ensure_ascii=False))
-        return 2
+        return EXIT_UNAVAILABLE
     index_path = target / "index.csv"
-    fields = ["status", "doi", "year", "authors", "title", "venue", "source", "license",
-              "bytes", "path", "retrieved_at", "sha256"]
+    fields = ["status", "doi", "year", "authors", "title", "venue", "source", "source_type",
+              "version", "license", "bytes", "path", "retrieved_at", "sha256"]
     missing = []
     with index_path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
@@ -1182,11 +1769,20 @@ def cmd_organize(args, cfg: dict) -> int:
         "missing_files": missing,
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 1 if missing else 0
+    return EXIT_PARTIAL if missing else EXIT_OK
+
+
+class CliArgumentParser(argparse.ArgumentParser):
+    """argparse 默认用 exit 2 表示参数错误；本工具统一用 1（见模块 docstring）。"""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: 参数错误: {message}", file=sys.stderr)
+        raise SystemExit(EXIT_USAGE)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = CliArgumentParser(
         description="OA 论文检索 / OA 全文定位 / PDF 下载归档（纯标准库）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("常用：")[-1] if "常用：" in __doc__ else "",
@@ -1214,6 +1810,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_batch.add_argument("file")
     p_batch.add_argument("--out")
     p_batch.add_argument("--force", action="store_true")
+    p_batch.add_argument("--workers", type=int, default=BATCH_DEFAULT_WORKERS,
+                         help="并发线程数（默认 3；1 表示串行）")
+    p_batch.add_argument("--resume", action="store_true",
+                         help="按断点文件续跑，跳过已下载/已存在/待核验条目")
+    p_batch.add_argument("--state", help="断点文件（默认 <out>/batch-state.jsonl）")
     p_batch.set_defaults(func=cmd_batch)
 
     p_organize = sub.add_parser("organize", help="由 manifest.jsonl 生成 index.csv")
@@ -1223,8 +1824,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_import = sub.add_parser("import-file", help="核验并登记浏览器或人工已下载的 PDF（不联网）")
     p_import.add_argument("file")
     p_import.add_argument("--doi", default="")
-    p_import.add_argument("--title", required=True, help="已确认的目标论文题名")
+    p_import.add_argument("--title", default="", help="已确认的目标论文题名（缺省时按 DOI 生成文件名）")
     p_import.add_argument("--source-url", default="")
+    p_import.add_argument("--name", default="", help="归档文件名（自动补 .pdf）")
+    p_import.add_argument("--authors", default="", help="作者，分号/逗号分隔，可省略")
+    p_import.add_argument("--year", type=int, default=None, help="出版年份，可省略")
+    p_import.add_argument("--venue", default="", help="期刊/会议名，可省略")
+    p_import.add_argument("--version-type", default="unknown",
+                          choices=["preprint", "accepted", "published", "unknown"],
+                          help="文献版本（默认 unknown）")
+    p_import.add_argument("--source-type", default="local",
+                          choices=["publisher", "repository", "oa", "local"],
+                          help="来源类型（默认 local）")
+    p_import.add_argument("--pretty", action="store_true",
+                          help="多行缩进 JSON（默认单行，便于逐行解析）")
     p_import.add_argument("--out")
     p_import.set_defaults(func=cmd_import_file)
     return parser
@@ -1232,23 +1845,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     sys.setrecursionlimit(10000)
-    args = build_parser().parse_args(argv)
+    try:
+        args = build_parser().parse_args(argv)
+    except SystemExit as exc:  # --help -> 0；参数错误 -> 1
+        return int(exc.code or 0)
     try:
         cfg = load_config(args.config)
     except (OSError, ValueError) as exc:
         print(json.dumps({"status": "config_error", "reason": str(exc)}, ensure_ascii=False))
-        return 2
+        return EXIT_USAGE
     if not cfg.get("email") and args.command in ("search", "oa", "fetch", "batch"):
         print("[warn] 建议在 config.json 填写 email（Crossref/Unpaywall 礼貌标识，能提高成功率）",
               file=sys.stderr)
     if args.command == "search" and not 1 <= args.limit <= 100:
         print(json.dumps({"status": "invalid_argument", "reason": "--limit 必须为 1..100"}))
-        return 2
+        return EXIT_USAGE
     try:
         return args.func(args, cfg)
     except (OSError, ValueError, RuntimeError) as exc:
         print(json.dumps({"status": "error", "reason": type(exc).__name__}, ensure_ascii=False))
-        return 1
+        return EXIT_USAGE
 
 
 if __name__ == "__main__":

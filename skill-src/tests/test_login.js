@@ -96,3 +96,23 @@ test('login arguments are separate from paper downloads',()=>{
   const parse=(...a)=>parseArgs(['node','script',...a]);assert.equal(parse('--login').login,true);assert.equal(parse('--login','--credentials','private.json').credentials,'private.json');
   assert.throws(()=>parse('--login','--url','https://example.org'));assert.throws(()=>parse('--login','--credentials'));
 });
+
+// P2-6：DPAPI 加密文件应能被读取，且显式传 .json 时优先使用同目录 .dpapi
+test('DPAPI credential file is decrypted and preferred over stale plaintext', {skip: process.platform !== 'win32'}, () => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'login-dpapi-test-'));
+  try {
+    const jsonFile=path.join(dir,'test.private.json');
+    const dpapiFile=path.join(dir,'test.private.dpapi');
+    fs.writeFileSync(jsonFile, JSON.stringify({...FAKE, username:'stale-account'}));
+    const b64=Buffer.from(JSON.stringify(FAKE),'utf8').toString('base64');
+    const script=`Add-Type -AssemblyName System.Security; $b=[Convert]::FromBase64String('${b64}'); $p=[Security.Cryptography.ProtectedData]::Protect($b,$null,'CurrentUser'); [IO.File]::WriteAllBytes('${dpapiFile.replace(/'/g,"''")}',$p)`;
+    const protectedRun=spawnSync('powershell.exe',['-NoProfile','-Command',script],{encoding:'utf8'});
+    assert.equal(protectedRun.status,0, protectedRun.stderr);
+    assert.ok(!fs.readFileSync(dpapiFile).includes(Buffer.from(FAKE.username)));
+    assert.equal(credentialStatus(dpapiFile).status,'ready');
+    assert.equal(readCredentials(dpapiFile).username,FAKE.username);
+    // 显式传 .json 时如果同目录有 .dpapi，应优先加密文件（门户保存后明文已删除）
+    assert.equal(credentialStatus(jsonFile).status,'ready');
+    assert.equal(readCredentials(jsonFile).username,FAKE.username);
+  } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+});

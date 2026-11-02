@@ -37,7 +37,7 @@ def check_bytes(body: bytes, doi: str = "", title: str = "") -> dict:
         for page in reader.pages:
             _ = page.mediabox
         text = "\n".join(page.extract_text() or "" for page in reader.pages[:2])
-        result.update(valid=True, pages=len(reader.pages))
+        result.update(valid=True, pages=len(reader.pages), text_available=bool(text.strip()))
         if len(reader.pages) == 1:
             result["review_required"] = ["single_page_confirm_full_text"]
         normalized = re.sub(r"\s+", "", text).casefold()
@@ -47,7 +47,7 @@ def check_bytes(body: bytes, doi: str = "", title: str = "") -> dict:
         norm_text = re.sub(r"[\W_]", "", text).casefold()
         title_match = len(norm_title) >= 12 and norm_title in norm_text
         doi_match = bool(expected and expected in normalized)
-        result.update(doi_match=doi_match, title_match=title_match)
+        result.update(doi_match=doi_match, title_match=title_match, title_checkable=len(norm_title)>=12)
         if title_match and (not expected or doi_match):
             result["identity"] = "matched"
         result["reason"] = "checked" if result["identity"] == "matched" else "confirm_article_identity"

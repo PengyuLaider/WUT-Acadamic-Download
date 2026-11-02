@@ -1,5 +1,5 @@
 {
-  "_readme": "通用学校与 OA 配置，不放账号密码。用户要求的本机账号密码请填包根目录 登录配置.private.json，由 登录图书馆.ps1 入口读取；也保留 DPAPI/环境变量给原通用表单辅助使用。邮箱影响需要邮箱的 OA 来源；不填写时跳过对应来源。",
+  "_readme": "通用学校与 OA 配置，不放账号密码。账号密码优先由配置界面用 Windows DPAPI 保存为包根目录 登录配置.private.dpapi（回退 登录配置.private.json），由 登录图书馆.ps1 读取；campus_net.ps1 -Action save-cred 的通用 DPAPI 凭据路径见 credentials.dpapi_file。邮箱影响需要邮箱的 OA 来源；不填写时跳过对应来源。",
   "school": {
     "name": "武汉理工大学",
     "domains": [
@@ -34,7 +34,35 @@
       "evidence": "reachability_only"
     }
   ],
-  "campus_cidrs": [],
+  "campus_cidrs": [
+    "202.114.48.0/20",
+    "202.114.88.0/21",
+    "218.197.96.0/19"
+  ],
+  "campus_cidrs_mode": "append",
+  "campus_private_cidrs": [
+    "10.82.0.0/16",
+    "10.83.0.0/16"
+  ],
+  "campus_private_cidrs_mode": "append",
+  "proxy_mode": "direct",
+  "cernet": {
+    "lookup_enabled": true,
+    "timeout_seconds": 8,
+    "lookup_urls": [
+      "https://ipinfo.io/{ip}/json",
+      "https://api.bgpview.io/ip/{ip}"
+    ],
+    "expected_asns": [
+      4538
+    ],
+    "org_markers": [
+      "CERNET",
+      "China Education and Research Network",
+      "教育网",
+      "中国教育和科研计算机网"
+    ]
+  },
   "captive_portal_probes": [
     {
       "url": "http://www.msftconnecttest.com/connecttest.txt",
@@ -104,6 +132,12 @@
   "credentials": {
     "dpapi_file": ""
   },
+  "chinese_doi_prefixes": [
+    "10.16383",
+    "10.19721",
+    "10.15918",
+    "10.3969"
+  ],
   "sources": [
     "openalex",
     "crossref",
