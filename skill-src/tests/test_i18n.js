@@ -3,7 +3,7 @@ const test=require('node:test'),assert=require('node:assert/strict'),fs=require(
 const root=path.resolve(__dirname,'../..'),dictionary=require(path.join(root,'ui/i18n.js'));
 test('UI provides translations for static text and labels',()=>{
  const html=fs.readFileSync(path.join(root,'ui/index.html'),'utf8');
- const texts=[...html.matchAll(/>([^<>]+)</g)].map(m=>m[1].trim()).filter(t=>/[\u4e00-\u9fff]/.test(t)&&!t.startsWith('.\\')&&!t.endsWith('.json')&&!['中文','Language / 语言'].includes(t));
+ const texts=[...html.matchAll(/>([^<>]+)</g)].map(m=>m[1].trim()).filter(t=>/[\u4e00-\u9fff]/.test(t)&&!t.startsWith('.\\')&&!t.endsWith('.json')&&!t.endsWith('.dpapi')&&!['中文','Language / 语言'].includes(t));
  for(const text of texts)assert.ok(dictionary[text],`Missing translation: ${text}`);
 });
 test('dynamic validation and save states are translated',()=>{

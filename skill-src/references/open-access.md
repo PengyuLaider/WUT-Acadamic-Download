@@ -13,6 +13,14 @@
 
 DOAJ、CORE、DataCite、bioRxiv 等不是当前脚本已实现的完整下载链路，不应写成自动支持。需扩展时查服务当前官方文档；不要自动为用户申请 key、邮箱或付费额度。
 
+## 中文 DOI
+
+`10.16383/*`（自动化学报等）、`10.19721/*`、`10.15918/*`、`10.3969/*` 等中文 DOI 常不被 Crossref/OpenAlex/Semantic Scholar 收录，直接查会 404。`paper_oa.py` 对前缀命中的 DOI 先走 `https://www.chndoi.org/Resolution/Handler?doi=...` 跟随重定向拿落地页，失败再回退 `https://doi.org/<doi>`；从落地页 HTML 通用提取 `citation_pdf_url`、`.pdf`、`/pdf/`、含“全文/下载”的链接（过滤图片、js、css、mailto 等），作为机构/OA 位置。找不到落地页时返回 `source_unavailable` 并附中文提示，不伪造期刊官网 URL；可把新前缀加到 `config.chinese_doi_prefixes`。真实 chndoi 链路与期刊页提取命中率需现场复核。
+
+## 批处理与退出码
+
+`batch` 默认 3 并发（`--workers 1` 串行），支持 `--resume`、`--state <out>/batch-state.jsonl`；每篇结果追加状态行（identifier/status/path/error/timestamp），中断后可续跑；同 host 请求用全局锁限速。退出码统一：`0` 成功/已保存、`1` 参数或配置错误、`2` 需要用户/无合法 OA、`3` 部分完成/待核验/下载失败。
+
 ## 失败判断
 
 - 一次来源失败不等于论文不存在。`source_unavailable` 表示至少部分来源错误，未定位到全文时结论不完整。

@@ -1,13 +1,47 @@
 'use strict';
 // Local credential consumer. Never print credentials or pass them as CLI arguments.
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const { spawnSync } = require('child_process');
 const ALLOWED_ORIGINS = new Set(['https://webvpn.whut.edu.cn', 'https://zhlgd.whut.edu.cn']);
-const DEFAULT_FILE = path.resolve(__dirname, '../../登录配置.private.json');
+
+// P2-2：兼容源码包根、DSH 安装目录、当前工作目录和用户目录，避免装成独立 skill 后找不到配置
+function credentialCandidates() {
+  const packageRoot=path.resolve(__dirname,'../..');
+  const bases=process.env.CAMPUS_CREDENTIALS?[process.env.CAMPUS_CREDENTIALS]:
+    (fs.existsSync(path.join(packageRoot,'campus_portal.py'))?[path.join(packageRoot,'登录配置.private.json')]:[]);
+  const out = [];
+  for (const file of bases) {
+    // P2-6：优先找 DPAPI 加密版本，其次明文版本
+    if (/\.json$/i.test(file)) out.push(file.replace(/\.json$/i, '.dpapi'));
+    out.push(file);
+  }
+  return out;
+}
+
+function findDefaultFile() {
+  const candidates = credentialCandidates();
+  for (const file of candidates) {
+    try { if (fs.existsSync(file)) return file; } catch { /* 继续下一个 */ }
+  }
+  return candidates[0] || '';
+}
+
+const DEFAULT_FILE = findDefaultFile();
 const SELECTORS = {
   username: 'input[name="un"],input#un,input[name="username"],input#username,input[autocomplete="username"]',
   password: 'input[type="password"]',
 };
+
+// Windows DPAPI 解密：只把密文文件路径交给 PowerShell，明文仅经 stdout 回到本进程，不落盘/不打印
+function decryptDpapi(file) {
+  const script = path.join(__dirname,'dpapi_bridge.py');
+  const python=process.env.CAMPUS_PYTHON||process.env.DSH_PYTHON||'python';
+  const run=spawnSync(python,[script,file],{encoding:'utf8',timeout:30000,windowsHide:true});
+  if (run.error || run.status !== 0) throw new Error('credential_dpapi_decrypt_failed');
+  return run.stdout;
+}
 
 function approvedOrigin(value) {
   try {
@@ -16,10 +50,25 @@ function approvedOrigin(value) {
   } catch { return false; }
 }
 
+function effectiveFile(file) {
+  // 显式传 .json 时，如果同目录已有 .dpapi（门户加密保存后删除了明文），优先用加密文件
+  if (/\.json$/i.test(file)) {
+    const encrypted = file.replace(/\.json$/i, '.dpapi');
+    try { if (fs.existsSync(encrypted)) return encrypted; } catch { /* 用原路径 */ }
+  }
+  return file;
+}
+
 function readCredentials(file = DEFAULT_FILE) {
+  file = effectiveFile(file);
   let value;
-  try { value = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')); }
-  catch { throw new Error('credential_file_unreadable_or_invalid_json'); }
+  try {
+    const raw = fs.readFileSync(file);
+    let text = raw.toString('utf8').replace(/^\uFEFF/, '').trim();
+    // 明文 JSON 以 { 开头；否则视为 DPAPI 二进制并用 PowerShell 解密（不打印明文）
+    if (!text.startsWith('{')) text = decryptDpapi(file);
+    value = JSON.parse(text.replace(/^\uFEFF/, ''));
+  } catch { throw new Error('credential_file_unreadable_or_invalid_json'); }
   if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error('credential_config_must_be_object');
   if (typeof value.enabled !== 'boolean' || typeof value.auto_submit !== 'boolean') throw new Error('credential_options_must_be_boolean');
   if (!approvedOrigin(value.login_url)) throw new Error('credential_login_origin_not_allowed');
@@ -32,6 +81,10 @@ function readCredentials(file = DEFAULT_FILE) {
 
 function credentialStatus(file = DEFAULT_FILE) {
   try {
+    if (!fs.existsSync(effectiveFile(file))) {
+      return {status:'config_not_found', searched:credentialCandidates(),
+        credential_values_returned:false, live_login_tested:false};
+    }
     const c = readCredentials(file);
     const missing = [];
     if (!c.username) missing.push('username');
@@ -111,4 +164,4 @@ if (require.main === module) {
   console.log(JSON.stringify(result));
   process.exit(result.status === 'ready' ? 0 : 2);
 }
-module.exports = {DEFAULT_FILE, approvedOrigin, readCredentials, credentialStatus, fillLogin};
+module.exports = {DEFAULT_FILE, credentialCandidates, findDefaultFile, approvedOrigin, readCredentials, credentialStatus, fillLogin};

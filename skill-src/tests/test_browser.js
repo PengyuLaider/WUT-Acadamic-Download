@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('fs'), os = require('os'), path = require('path');
-const {parseArgs} = require('../scripts/browser_dl'); // Import must not create a browser or directories.
+const {parseArgs, isPdfCandidateUrl, classifySource, isLoginWallPage, EXIT} = require('../scripts/browser_dl'); // Import must not create a browser or directories.
 const {Cdp, publicUrl, sanitize, basicPdf, requiresUser} = require('../scripts/browser_support');
 const args = (...s) => parseArgs(['node','script',...s]);
 
@@ -47,4 +47,61 @@ test('CDP timeout rejects',async()=>{
 });
 test('CDP disconnect rejects all requests',async()=>{
   const ws=new FakeSocket(),cdp=new Cdp(ws,500);const p=cdp.send('Page.enable');ws.close();await assert.rejects(p,/disconnected/);assert.equal(cdp.pending.size,0);
+});
+
+// P0-1：只接受明确 PDF 下载地址，参考文献/配图/静态资源不能被当全文
+test('PDF candidate whitelist rejects references/images',()=>{
+  for (const u of [
+    'https://www.sciencedirect.com/science/article/pii/S0016236124020027/pdfft?md5=x&pid=1-s2.0-S0016236124020027-main.pdf',
+    'https://ieeexplore.ieee.org/stampPDF/getPDF.jsp?tp=&arnumber=771073',
+    'https://onlinelibrary.wiley.com/doi/pdfdirect/10.1002/x',
+    'https://example.org/paper.pdf',
+    'https://bar.cnki.net/bar/download/order?id=x',
+    'https://oss.wanfangdata.com.cn/file/download/perio_x.aspx',
+  ]) assert.equal(isPdfCandidateUrl(u),true,u);
+  for (const u of [
+    'https://ars.els-cdn.com/content/image/1-s2.0-S0016236124020027-gr1_lrg.jpg',
+    'https://example.org/logo.svg',
+    'https://example.org/references',
+  ]) assert.equal(isPdfCandidateUrl(u),false,u);
+  // 参考文献里的其他文章 pdfft：给定当前文章 PII 时必须排除
+  assert.equal(isPdfCandidateUrl('https://www.sciencedirect.com/science/article/pii/S0016236123020239/pdfft?md5=y','S0016236124020027'),false);
+});
+
+// P0-2：WebVPN/CAS 登录墙不能被当作文章页
+test('login wall detection',()=>{
+  assert.equal(isLoginWallPage({title:'资源访问控制系统',url:'https://webvpn.whut.edu.cn/login',bodyText:'账号登录'}),true);
+  assert.equal(isLoginWallPage({title:'统一身份认证',url:'https://zhlgd.whut.edu.cn/tpass/login',bodyText:'登录'}),true);
+  assert.equal(isLoginWallPage({title:'论文标题 - ScienceDirect',url:'https://www.sciencedirect.com/science/article/pii/X',bodyText:'Full text access'}),false);
+  assert.equal(isLoginWallPage({title:'论文标题',url:'https://example.org/article',bodyText:'Access through your institution'}),false);
+  assert.equal(isLoginWallPage({title:'登录',url:'https://example.org/login',passwordEl:true,bodyText:'请登录'}),true);
+});
+
+// P2-8：来源/版本标注（禁止把预印本当出版稿）
+test('source and version classification',()=>{
+  assert.deepEqual(classifySource('https://arxiv.org/pdf/2106.09685','10.48550/arXiv.2106.09685'),{sourceType:'repository',versionType:'preprint'});
+  assert.deepEqual(classifySource('https://www.sciencedirect.com/science/article/pii/X','10.1016/j.fuel.2024.132853'),{sourceType:'publisher',versionType:'published'});
+  assert.deepEqual(classifySource('https://example.org/x','10.1234/x'),{sourceType:'unknown',versionType:'unknown'});
+});
+
+test('exit code contract',()=>{
+  assert.deepEqual(EXIT,{OK:0,ERROR:1,NEED_USER:2,PARTIAL:3});
+  assert.throws(()=>args('--url','https://e.org','--version-type','draft'));
+  assert.throws(()=>args('--url','https://e.org','--source-type','preprint'));
+  assert.equal(args('--url','https://e.org','--version-type','preprint').versionType,'preprint');
+  assert.equal(args('--url','https://e.org','--skip-identity-check').skipIdentityCheck,true);
+});
+
+test('verification requires title and DOI agreement and full-text review',()=>{
+ const {verificationStatus}=require('../scripts/browser_dl');
+ assert.equal(verificationStatus({available:true,valid:true,doi_match:true,identity:'unverified'}),'saved_pending_verification');
+ assert.equal(verificationStatus({available:true,valid:true,identity:'matched',review_required:['single_page']}),'saved_pending_verification');
+ assert.equal(verificationStatus({available:true,valid:true,text_available:true,title_checkable:true,title_match:false}),'wrong_document');
+ assert.equal(verificationStatus({available:false}),'saved_pending_verification');
+ assert.equal(verificationStatus({available:true,valid:true,identity:'matched'}),'downloaded');
+});
+test('click candidates cannot select high resolution images or another PII',()=>{
+ const {isPdfCandidateUrl}=require('../scripts/browser_dl');
+ for(const url of ['https://ars.els-cdn.com/a.pdf','https://example.org/a.pdf.jpg','https://example.org/pii/S999/pdfft'])assert.equal(isPdfCandidateUrl(url,'S123'),false);
+ assert.equal(isPdfCandidateUrl('https://pubs.acs.org/iecred/article-pdf/44/16/a.pdf',''),true);
 });

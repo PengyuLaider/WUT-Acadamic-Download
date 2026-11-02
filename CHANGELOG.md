@@ -1,5 +1,14 @@
 # 更新记录
 
+## v2.1.0 — 2026-11-02
+
+- 整合新版 DPAPI 门户、批次并发与限速、中文 DOI 路径、来源/版本字段和 MIT 许可。
+- 点击过滤覆盖配图与参考文献；下载成功要求结构、题名、DOI 与单页检查共同通过，可疑文件隔离保留。
+- 续跑重新验证文件和身份；加密失败不回退明文；代理变化不自动关闭已有会话。
+- 修复双语提示、独立安装凭据路径、源码导出隐私过滤及本地交付结构。
+- New DPAPI defaults, concurrent/resumable batches, Chinese DOI discovery and provenance fields. Verification is conservative; questionable files are retained, not deleted.
+
+
 ## main 文档更新 / Documentation on main
 
 - 丰富中英文项目介绍、适用场景、入口选择、输出与结果状态、智能体任务示例和常见问题。

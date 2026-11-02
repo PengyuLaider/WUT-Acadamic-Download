@@ -12,3 +12,8 @@
 /skill-src/config/config.json
 
 /dist/
+
+*.dpapi
+*.bundle
+.deps/
+.env*
